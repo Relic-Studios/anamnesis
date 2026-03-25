@@ -102,6 +102,11 @@ class SignalProxyTrainer:
                     if pad_size > 0:
                         hidden = torch.nn.functional.pad(hidden, (0, pad_size))
 
+                # Move to proxy's device
+                device = next(self.proxy.parameters()).device
+                hidden = hidden.to(device)
+                signal_target = signal_target.to(device)
+
                 # Forward
                 predicted = self.proxy(hidden)
                 loss = nn.functional.mse_loss(predicted, signal_target)
