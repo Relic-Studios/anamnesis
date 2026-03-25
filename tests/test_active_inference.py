@@ -4,14 +4,14 @@ import pytest
 import torch
 import torch.nn as nn
 
-from hope.active_inference.free_energy import (
+from anamnesis.active_inference.free_energy import (
     SignalProxy,
     SignalFreeEnergy,
     IdentityDrift,
     CompositeHopeLoss,
 )
-from hope.active_inference.drift import NeutralDrift
-from hope.core.cms import ContinuumMemorySystem
+from anamnesis.active_inference.drift import NeutralDrift
+from anamnesis.core.cms import ContinuumMemorySystem
 
 
 class TestSignalProxy:

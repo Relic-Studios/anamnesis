@@ -3,7 +3,7 @@
 import pytest
 import torch
 
-from hope.core.dgd import DeltaGradientDescent
+from anamnesis.core.dgd import DeltaGradientDescent
 
 
 class TestDeltaGradientDescent:

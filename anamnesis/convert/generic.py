@@ -19,10 +19,10 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 
-from hope.core.cms import ContinuumMemorySystem, CMSVariant
-from hope.core.self_ref import SelfReferentialAttention
-from hope.core.block import HopeBlock
-from hope.core.model import HopeModel, HopeConfig
+from anamnesis.core.cms import ContinuumMemorySystem, CMSVariant
+from anamnesis.core.self_ref import SelfReferentialAttention
+from anamnesis.core.block import HopeBlock
+from anamnesis.core.model import HopeModel, HopeConfig
 
 
 def extract_mlp_weights(

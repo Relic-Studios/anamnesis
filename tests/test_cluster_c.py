@@ -4,11 +4,11 @@ import pytest
 import torch
 import torch.nn as nn
 
-from hope.core.cms import CMSLevel, ContinuumMemorySystem
-from hope.active_inference.dreaming import (
+from anamnesis.core.cms import CMSLevel, ContinuumMemorySystem
+from anamnesis.active_inference.dreaming import (
     NREMConsolidation, REMExploration, DreamCycle, DreamResult,
 )
-from hope.active_inference.toroidal import ToroidalFlow, LevelSignal
+from anamnesis.active_inference.toroidal import ToroidalFlow, LevelSignal
 
 
 class TestNREMConsolidation:

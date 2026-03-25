@@ -18,7 +18,7 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 
-from hope.core.dgd import DeltaGradientDescent
+from anamnesis.core.dgd import DeltaGradientDescent
 
 
 class CMSVariant(Enum):

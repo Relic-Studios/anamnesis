@@ -17,9 +17,9 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 
-from hope.core.block import HopeBlock
-from hope.core.cms import CMSVariant
-from hope.core.memory import MemoryState
+from anamnesis.core.block import HopeBlock
+from anamnesis.core.cms import CMSVariant
+from anamnesis.core.memory import MemoryState
 
 
 @dataclass

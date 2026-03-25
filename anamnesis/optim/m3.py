@@ -25,7 +25,7 @@ import torch
 from torch import Tensor
 from torch.optim import Optimizer
 
-from hope.optim.newton_schulz import newton_schulz
+from anamnesis.optim.newton_schulz import newton_schulz
 
 
 class M3(Optimizer):

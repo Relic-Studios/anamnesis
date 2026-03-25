@@ -23,9 +23,9 @@ from typing import Optional
 import torch
 import torch.nn as nn
 
-from hope.core.cms import CMSVariant
-from hope.core.model import HopeModel, HopeConfig
-from hope.convert.generic import model_to_hope
+from anamnesis.core.cms import CMSVariant
+from anamnesis.core.model import HopeModel, HopeConfig
+from anamnesis.convert.generic import model_to_hope
 
 
 def qwen_to_hope(
@@ -45,7 +45,7 @@ def qwen_to_hope(
     Requires the `transformers` package (in the [convert] extra).
 
     Example:
-        from hope.convert import qwen_to_hope
+        from anamnesis.convert import qwen_to_hope
 
         model = qwen_to_hope(
             "Qwen/Qwen2.5-7B-Instruct",

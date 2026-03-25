@@ -4,7 +4,7 @@ import pytest
 import torch
 import torch.nn as nn
 
-from hope.core.memory import NeuralMemory, MemoryMLP, MemoryState, _memory_loss_fn
+from anamnesis.core.memory import NeuralMemory, MemoryMLP, MemoryState, _memory_loss_fn
 from torch.func import grad, vmap
 
 

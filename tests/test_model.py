@@ -3,9 +3,9 @@
 import pytest
 import torch
 
-from hope.core.block import HopeBlock
-from hope.core.cms import CMSVariant
-from hope.core.model import HopeModel, HopeConfig
+from anamnesis.core.block import HopeBlock
+from anamnesis.core.cms import CMSVariant
+from anamnesis.core.model import HopeModel, HopeConfig
 
 
 class TestHopeBlock:

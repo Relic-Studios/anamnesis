@@ -4,9 +4,9 @@ import pytest
 import torch
 from torch import Tensor
 
-from hope.active_inference.precision import PrecisionNetwork, PrecisionModulator
-from hope.active_inference.gardener import GardenerStream, GardenerOutput
-from hope.active_inference.thompson import ThompsonLearningRate, BetaPosterior
+from anamnesis.active_inference.precision import PrecisionNetwork, PrecisionModulator
+from anamnesis.active_inference.gardener import GardenerStream, GardenerOutput
+from anamnesis.active_inference.thompson import ThompsonLearningRate, BetaPosterior
 
 
 class TestPrecisionNetwork:

@@ -4,8 +4,8 @@ import pytest
 import torch
 import torch.nn as nn
 
-from hope.optim.m3 import M3
-from hope.optim.newton_schulz import newton_schulz
+from anamnesis.optim.m3 import M3
+from anamnesis.optim.newton_schulz import newton_schulz
 
 
 class TestNewtonSchulz:

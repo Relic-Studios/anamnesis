@@ -29,8 +29,8 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 
-from hope.active_inference.precision import PrecisionNetwork, PrecisionModulator
-from hope.active_inference.free_energy import SignalProxy
+from anamnesis.active_inference.precision import PrecisionNetwork, PrecisionModulator
+from anamnesis.active_inference.free_energy import SignalProxy
 
 
 @dataclass

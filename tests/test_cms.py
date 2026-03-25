@@ -3,7 +3,7 @@
 import pytest
 import torch
 
-from hope.core.cms import CMSLevel, ContinuumMemorySystem, CMSVariant
+from anamnesis.core.cms import CMSLevel, ContinuumMemorySystem, CMSVariant
 
 
 class TestCMSLevel:

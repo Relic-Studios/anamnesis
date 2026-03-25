@@ -19,8 +19,8 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 
-from hope.core.cms import ContinuumMemorySystem, CMSVariant
-from hope.core.memory import NeuralMemory, MemoryState
+from anamnesis.core.cms import ContinuumMemorySystem, CMSVariant
+from anamnesis.core.memory import NeuralMemory, MemoryState
 
 
 class HopeBlock(nn.Module):

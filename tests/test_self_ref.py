@@ -4,7 +4,7 @@ import pytest
 import torch
 import torch.nn as nn
 
-from hope.core.self_ref import AdaptiveProjection, SelfReferentialAttention
+from anamnesis.core.self_ref import AdaptiveProjection, SelfReferentialAttention
 
 
 class TestAdaptiveProjection:

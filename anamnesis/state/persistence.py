@@ -36,7 +36,7 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 
-from hope.core.model import HopeModel
+from anamnesis.core.model import HopeModel
 
 
 STATE_VERSION = 1

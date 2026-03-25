@@ -20,9 +20,9 @@ the architecture works end-to-end, not to produce useful outputs.
 import torch
 from torch import Tensor
 
-from hope.core.model import HopeModel, HopeConfig
-from hope.optim.m3 import M3
-from hope.active_inference import (
+from anamnesis.core.model import HopeModel, HopeConfig
+from anamnesis.optim.m3 import M3
+from anamnesis.active_inference import (
     CompositeHopeLoss,
     NeutralDrift,
     GardenerStream,
@@ -30,12 +30,12 @@ from hope.active_inference import (
     ToroidalFlow,
     DreamCycle,
 )
-from hope.state.persistence import save_cms_state, load_cms_state, save_soul_checkpoint
+from anamnesis.state.persistence import save_cms_state, load_cms_state, save_soul_checkpoint
 
 
 def main():
     print("=" * 60)
-    print("Hope-Didymus: End-to-End Training Demo")
+    print("Anamnesis: End-to-End Training Demo")
     print("=" * 60)
 
     # ── Config ──
