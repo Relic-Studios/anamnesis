@@ -38,7 +38,7 @@ class HopeConfig:
     cms_levels: int = 4
     cms_chunk_sizes: list[int] | None = None
     cms_variant: str = "nested"
-    cms_hidden_mult: float = 5.286  # Qwen's 18944/3584 ratio
+    cms_hidden_mult: float | list[float] = 5.286  # Qwen's 18944/3584 ratio
 
     # Neural memory configuration
     use_neural_memory: bool = False

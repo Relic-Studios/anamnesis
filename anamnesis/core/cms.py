@@ -161,7 +161,7 @@ class ContinuumMemorySystem(nn.Module):
         dim: int,
         num_levels: int = 4,
         chunk_sizes: list[int] | None = None,
-        hidden_mult: float = 4.0,
+        hidden_mult: float | list[float] = 4.0,
         variant: CMSVariant = CMSVariant.NESTED,
         activation: nn.Module | None = None,
     ):
@@ -178,15 +178,23 @@ class ContinuumMemorySystem(nn.Module):
         assert chunk_sizes == sorted(chunk_sizes), "chunk_sizes must be ascending"
         self.chunk_sizes = chunk_sizes
 
+        # Per-level hidden multipliers: slower levels can be smaller
+        if isinstance(hidden_mult, (int, float)):
+            hidden_mults = [hidden_mult] * num_levels
+        else:
+            assert len(hidden_mult) == num_levels
+            hidden_mults = list(hidden_mult)
+        self.hidden_mults = hidden_mults
+
         # Build the CMS levels
         self.levels = nn.ModuleList([
             CMSLevel(
                 dim=dim,
-                hidden_mult=hidden_mult,
+                hidden_mult=hm,
                 chunk_size=cs,
                 activation=activation,
             )
-            for cs in chunk_sizes
+            for cs, hm in zip(chunk_sizes, hidden_mults)
         ])
 
         # Independent variant: learned aggregation weights (Eq 74)

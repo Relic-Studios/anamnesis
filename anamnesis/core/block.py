@@ -54,7 +54,7 @@ class HopeBlock(nn.Module):
         cms_levels: int = 4,
         cms_chunk_sizes: list[int] | None = None,
         cms_variant: CMSVariant = CMSVariant.NESTED,
-        cms_hidden_mult: float = 4.0,
+        cms_hidden_mult: float | list[float] = 4.0,
         use_neural_memory: bool = False,
         mem_heads: int = 4,
         mem_depth: int = 2,
