@@ -51,7 +51,7 @@ dev = [
 all = ["anamnesis[convert,kernels,train,dev]"]
 
 [project.urls]
-Repository = "https://github.com/aidangarza/anamnesis"
+Repository = "https://github.com/Relic-Studios/anamnesis"
 
 [tool.setuptools.packages.find]
 include = ["anamnesis*"]
