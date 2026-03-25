@@ -8,6 +8,8 @@ from hope.active_inference.drift import NeutralDrift
 from hope.active_inference.precision import PrecisionNetwork, PrecisionModulator
 from hope.active_inference.gardener import GardenerStream, GardenerOutput
 from hope.active_inference.thompson import ThompsonLearningRate, BetaPosterior
+from hope.active_inference.dreaming import DreamCycle, DreamResult
+from hope.active_inference.toroidal import ToroidalFlow, LevelSignal
 
 __all__ = [
     "SignalFreeEnergy",
@@ -21,4 +23,8 @@ __all__ = [
     "GardenerOutput",
     "ThompsonLearningRate",
     "BetaPosterior",
+    "DreamCycle",
+    "DreamResult",
+    "ToroidalFlow",
+    "LevelSignal",
 ]
