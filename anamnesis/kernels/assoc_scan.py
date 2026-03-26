@@ -22,8 +22,16 @@ Reference: lucidrains/titans-pytorch AssocScan, Blelloch 1990.
 
 from __future__ import annotations
 
+import math
+
 import torch
 from torch import Tensor
+
+from anamnesis.kernels import _TRITON_AVAILABLE
+
+if _TRITON_AVAILABLE:
+    import triton
+    import triton.language as tl
 
 
 def associative_scan_sequential(
@@ -72,20 +80,96 @@ def associative_scan(
     Falls back to sequential PyTorch if Triton is unavailable or input is on CPU.
 
     Args:
-        decay: Decay factors (batch, seq_len, ...).
-        values: Input values (batch, seq_len, ...).
-        initial: Initial state (batch, ...).
+        decay: Decay factors (batch, seq_len, dim).
+        values: Input values (batch, seq_len, dim).
+        initial: Initial state (batch, dim).
         use_triton: Whether to attempt Triton kernel.
 
     Returns:
-        Scanned output (batch, seq_len, ...).
+        Scanned output (batch, seq_len, dim).
     """
-    from anamnesis.kernels import _TRITON_AVAILABLE
-
-    if use_triton and _TRITON_AVAILABLE and decay.is_cuda:
+    if use_triton and _TRITON_AVAILABLE and decay.is_cuda and decay.dim() == 3:
         return _associative_scan_triton(decay, values, initial)
 
     return associative_scan_sequential(decay, values, initial)
+
+
+if _TRITON_AVAILABLE:
+    @triton.jit
+    def _assoc_scan_up_kernel(
+        decay_ptr, values_ptr, out_decay_ptr, out_values_ptr,
+        batch, seq_len, dim,
+        stride_b, stride_s, stride_d,
+        step: tl.constexpr, BLOCK_D: tl.constexpr,
+    ):
+        """Up-sweep phase: combine pairs at increasing stride."""
+        pid_b = tl.program_id(0)
+        pid_s = tl.program_id(1)
+        pid_d = tl.program_id(2)
+
+        # Which pair are we combining?
+        pair_stride = 1 << step  # 2^step
+        right_idx = (pid_s + 1) * (pair_stride * 2) - 1
+        left_idx = right_idx - pair_stride
+
+        if right_idx >= seq_len or left_idx < 0:
+            return
+
+        d_off = pid_d * BLOCK_D + tl.arange(0, BLOCK_D)
+        mask = d_off < dim
+
+        # Load left and right (decay, value) pairs
+        left_base = pid_b * stride_b + left_idx * stride_s
+        right_base = pid_b * stride_b + right_idx * stride_s
+
+        d_left = tl.load(out_decay_ptr + left_base + d_off * stride_d, mask=mask)
+        v_left = tl.load(out_values_ptr + left_base + d_off * stride_d, mask=mask)
+        d_right = tl.load(out_decay_ptr + right_base + d_off * stride_d, mask=mask)
+        v_right = tl.load(out_values_ptr + right_base + d_off * stride_d, mask=mask)
+
+        # Combine: (d_r, v_r) ∘ (d_l, v_l) = (d_r * d_l, d_r * v_l + v_r)
+        new_decay = d_right * d_left
+        new_value = d_right * v_left + v_right
+
+        tl.store(out_decay_ptr + right_base + d_off * stride_d, new_decay, mask=mask)
+        tl.store(out_values_ptr + right_base + d_off * stride_d, new_value, mask=mask)
+
+    @triton.jit
+    def _assoc_scan_down_kernel(
+        out_decay_ptr, out_values_ptr,
+        batch, seq_len, dim,
+        stride_b, stride_s, stride_d,
+        step: tl.constexpr, BLOCK_D: tl.constexpr,
+    ):
+        """Down-sweep phase: propagate results at decreasing stride."""
+        pid_b = tl.program_id(0)
+        pid_s = tl.program_id(1)
+        pid_d = tl.program_id(2)
+
+        pair_stride = 1 << step
+        # Target: elements at positions that need propagation
+        left_idx = (pid_s + 1) * (pair_stride * 2) - 1
+        right_idx = left_idx + pair_stride
+
+        if right_idx >= seq_len or left_idx < 0:
+            return
+
+        d_off = pid_d * BLOCK_D + tl.arange(0, BLOCK_D)
+        mask = d_off < dim
+
+        left_base = pid_b * stride_b + left_idx * stride_s
+        right_base = pid_b * stride_b + right_idx * stride_s
+
+        d_left = tl.load(out_decay_ptr + left_base + d_off * stride_d, mask=mask)
+        v_left = tl.load(out_values_ptr + left_base + d_off * stride_d, mask=mask)
+        d_right = tl.load(out_decay_ptr + right_base + d_off * stride_d, mask=mask)
+        v_right = tl.load(out_values_ptr + right_base + d_off * stride_d, mask=mask)
+
+        new_decay = d_right * d_left
+        new_value = d_right * v_left + v_right
+
+        tl.store(out_decay_ptr + right_base + d_off * stride_d, new_decay, mask=mask)
+        tl.store(out_values_ptr + right_base + d_off * stride_d, new_value, mask=mask)
 
 
 def _associative_scan_triton(
@@ -94,34 +178,68 @@ def _associative_scan_triton(
     initial: Tensor | None = None,
 ) -> Tensor:
     """
-    Triton-accelerated parallel associative scan.
+    Triton-accelerated parallel associative scan using Blelloch algorithm.
 
-    Uses the Blelloch up-sweep / down-sweep algorithm:
-    1. Up-sweep: combine pairs at increasing stride
-    2. Down-sweep: propagate results back at decreasing stride
+    Args:
+        decay: (batch, seq_len, dim)
+        values: (batch, seq_len, dim)
+        initial: (batch, dim) or None
 
-    Total work: O(N log N), depth: O(log N)
-
-    NOTE: This is a scaffold. The actual Triton kernel requires GPU testing.
-    Currently falls back to the sequential implementation.
+    Returns:
+        output: (batch, seq_len, dim)
     """
-    # TODO: Implement Triton kernel when GPU is available for testing
-    # The kernel structure follows:
-    #
-    # @triton.jit
-    # def _assoc_scan_kernel(
-    #     decay_ptr, values_ptr, output_ptr,
-    #     batch, seq_len, feat_dim,
-    #     BLOCK_SIZE: tl.constexpr,
-    # ):
-    #     # Up-sweep phase
-    #     for stride in range(1, log2(seq_len)):
-    #         if tid % (2 * stride) == 0:
-    #             # Combine: (d_i, v_i) ∘ (d_j, v_j) = (d_i*d_j, d_i*v_j + v_i)
-    #             output[tid] = decay[tid] * output[tid - stride] + values[tid]
-    #
-    #     # Down-sweep phase (reverse)
-    #     ...
-    #
-    # For now, use sequential fallback
-    return associative_scan_sequential(decay, values, initial)
+    batch, seq_len, dim = decay.shape
+
+    # Incorporate initial state into first position
+    if initial is not None:
+        values = values.clone()
+        values[:, 0] = decay[:, 0] * initial + values[:, 0]
+
+    # For very short sequences, just use sequential
+    if seq_len <= 2:
+        return associative_scan_sequential(decay, values, initial if initial is not None and seq_len > 0 else None)
+
+    # Work on contiguous copies
+    out_decay = decay.contiguous().clone()
+    out_values = values.contiguous().clone()
+
+    stride_b = out_decay.stride(0)
+    stride_s = out_decay.stride(1)
+    stride_d = out_decay.stride(2)
+
+    BLOCK_D = triton.next_power_of_2(dim)
+    if BLOCK_D > 1024:
+        BLOCK_D = 1024
+
+    num_steps = int(math.ceil(math.log2(seq_len)))
+    num_d_blocks = (dim + BLOCK_D - 1) // BLOCK_D
+
+    # Up-sweep
+    for step in range(num_steps):
+        pair_stride = 1 << step
+        num_pairs = seq_len // (pair_stride * 2)
+        if num_pairs == 0:
+            break
+        grid = (batch, num_pairs, num_d_blocks)
+        _assoc_scan_up_kernel[grid](
+            out_decay, out_values, out_decay, out_values,
+            batch, seq_len, dim,
+            stride_b, stride_s, stride_d,
+            step=step, BLOCK_D=BLOCK_D,
+        )
+
+    # Down-sweep
+    for step in range(num_steps - 2, -1, -1):
+        pair_stride = 1 << step
+        num_pairs = seq_len // (pair_stride * 2) - 1
+        if num_pairs <= 0:
+            continue
+        grid = (batch, num_pairs, num_d_blocks)
+        _assoc_scan_down_kernel[grid](
+            out_decay, out_values,
+            batch, seq_len, dim,
+            stride_b, stride_s, stride_d,
+            step=step, BLOCK_D=BLOCK_D,
+        )
+
+    return out_values

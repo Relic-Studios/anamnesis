@@ -70,22 +70,28 @@ class TestM3Optimizer:
         optimizer.step()
         optimizer.zero_grad()
 
-    def test_loss_decreases(self, simple_model):
-        """M3 should decrease loss on a simple problem."""
+    def test_loss_decreases(self):
+        """M3 should decrease loss on a simple problem with fixed data."""
+        torch.manual_seed(42)
+        model = nn.Sequential(
+            nn.Linear(16, 32, bias=True),
+            nn.ReLU(),
+            nn.Linear(32, 8, bias=True),
+        )
+        x = torch.randn(4, 16)
         target = torch.randn(4, 8)
-        optimizer = M3(simple_model.parameters(), lr=0.01, adam_lr=0.01)
+        optimizer = M3(model.parameters(), lr=0.01, adam_lr=0.01)
 
         losses = []
-        for _ in range(50):
-            x = torch.randn(4, 16)
-            y = simple_model(x)
+        for _ in range(100):
+            y = model(x)
             loss = nn.functional.mse_loss(y, target)
             losses.append(loss.item())
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
 
-        # Loss should generally decrease (allow some noise)
+        # Loss should decrease over 100 steps on fixed data
         assert losses[-1] < losses[0], f"Loss didn't decrease: {losses[0]:.4f} → {losses[-1]:.4f}"
 
     def test_weight_decay(self, simple_model):

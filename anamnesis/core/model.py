@@ -106,6 +106,8 @@ class HopeModel(nn.Module):
                 mem_heads=config.mem_heads,
                 mem_depth=config.mem_depth,
                 norm_eps=config.rms_norm_eps,
+                max_position_embeddings=config.max_position_embeddings,
+                rope_theta=config.rope_theta,
             )
             for _ in range(config.num_hidden_layers)
         ])
@@ -124,6 +126,7 @@ class HopeModel(nn.Module):
         self,
         input_ids: Tensor,
         attention_mask: Tensor | None = None,
+        position_ids: Tensor | None = None,
         labels: Tensor | None = None,
         memory_states: list[MemoryState | None] | None = None,
     ) -> dict[str, Tensor]:
@@ -133,6 +136,7 @@ class HopeModel(nn.Module):
         Args:
             input_ids: Token IDs (batch, seq_len).
             attention_mask: Attention mask.
+            position_ids: Position IDs for RoPE (batch, seq_len). Auto-generated if None.
             labels: Target token IDs for loss computation.
             memory_states: Per-layer neural memory states.
 
@@ -140,6 +144,10 @@ class HopeModel(nn.Module):
             Dict with 'logits' and optionally 'loss'.
         """
         hidden_states = self.embed_tokens(input_ids)
+
+        if position_ids is None:
+            seq_len = input_ids.shape[1]
+            position_ids = torch.arange(seq_len, device=input_ids.device).unsqueeze(0)
 
         if memory_states is None:
             memory_states = [None] * len(self.layers)
@@ -149,6 +157,7 @@ class HopeModel(nn.Module):
             hidden_states, new_mem = layer(
                 hidden_states,
                 attention_mask=attention_mask,
+                position_ids=position_ids,
                 memory_state=mem_state,
             )
             new_memory_states.append(new_mem)

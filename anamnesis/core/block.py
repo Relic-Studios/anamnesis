@@ -21,6 +21,7 @@ from torch import Tensor
 
 from anamnesis.core.cms import ContinuumMemorySystem, CMSVariant
 from anamnesis.core.memory import NeuralMemory, MemoryState
+from anamnesis.core.rope import RotaryEmbedding, apply_rotary_pos_emb
 
 
 class HopeBlock(nn.Module):
@@ -59,12 +60,17 @@ class HopeBlock(nn.Module):
         mem_heads: int = 4,
         mem_depth: int = 2,
         norm_eps: float = 1e-6,
+        max_position_embeddings: int = 32768,
+        rope_theta: float = 1_000_000.0,
     ):
         super().__init__()
         self.dim = dim
         self.num_attention_heads = num_attention_heads
         self.num_kv_heads = num_kv_heads or num_attention_heads
         self.head_dim = dim // num_attention_heads
+
+        # Rotary position embeddings
+        self.rotary_emb = RotaryEmbedding(self.head_dim, max_position_embeddings, rope_theta)
 
         # Pre-attention norm
         self.input_layernorm = nn.RMSNorm(dim, eps=norm_eps)
@@ -129,6 +135,12 @@ class HopeBlock(nn.Module):
         q = q.view(batch, seq_len, self.num_attention_heads, self.head_dim).transpose(1, 2)
         k = k.view(batch, seq_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
         v = v.view(batch, seq_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
+
+        # Apply RoPE to Q and K
+        if position_ids is None:
+            position_ids = torch.arange(seq_len, device=hidden_states.device).unsqueeze(0)
+        cos, sin = self.rotary_emb(v, position_ids)
+        q, k = apply_rotary_pos_emb(q, k, cos, sin)
 
         # GQA: expand KV heads
         if self.num_kv_heads < self.num_attention_heads:

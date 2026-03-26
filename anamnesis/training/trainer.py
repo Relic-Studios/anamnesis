@@ -147,6 +147,8 @@ class AnamnesisTrainer:
         # State
         self._step = 0
         self._prev_loss = float("inf")
+        self._replay_buffer: list[Tensor] = []
+        self._replay_buffer_max = 10
 
     def train(
         self,
@@ -186,6 +188,11 @@ class AnamnesisTrainer:
             # Forward
             output = self.model(input_ids, labels=input_ids)
             recon_loss = output["loss"]
+
+            # Maintain replay buffer for dream evaluation
+            self._replay_buffer.append(input_ids.detach())
+            if len(self._replay_buffer) > self._replay_buffer_max:
+                self._replay_buffer.pop(0)
 
             # Composite loss
             result = self.loss_fn(
@@ -247,18 +254,45 @@ class AnamnesisTrainer:
                     improving = recon_loss.item() < self._prev_loss
                     self.thompson.update_posteriors(improving, recon_loss.item() - self._prev_loss)
 
-                # Toroidal flow
+                # Toroidal flow — apply cross-level signals to plasticity
                 if self.toroidal:
+                    per_level_surprises = []
+                    for layer in self.model.layers:
+                        per_level_surprises.append(layer.cms.get_surprise())
+                    # Average surprise across layers, per CMS level
                     for lvl in range(self.model.config.cms_levels):
-                        self.toroidal.update_surprise(lvl, recon_loss.item())
+                        avg_surprise = sum(
+                            s[lvl] for s in per_level_surprises
+                        ) / len(per_level_surprises) if per_level_surprises else 0.0
+                        self.toroidal.update_surprise(lvl, avg_surprise)
                     signals = self.toroidal.check_signals()
+                    if signals:
+                        base_gates = [gard_out.plasticity_gate] * self.model.config.cms_levels
+                        modified_gates = self.toroidal.apply_signals(signals, base_gates)
+                        # Apply modified per-level gates to drift
+                        if self.drift.enabled:
+                            for layer in self.model.layers:
+                                for lvl_idx, level in enumerate(layer.cms.levels):
+                                    gate = modified_gates[lvl_idx] if lvl_idx < len(modified_gates) else gard_out.plasticity_gate
+                                    self.drift.apply(level.parameters(), gate)
 
-                # Dream cycle
-                if self.dreamer and gard_out.should_dream:
-                    dream_eval = lambda m: 0.5  # TODO: use replay buffer
-                    dream_result = self.dreamer.dream(
-                        self.model.layers[0].cms.levels, dream_eval,
-                    )
+                # Dream cycle — use replay buffer for evaluation
+                if self.dreamer and gard_out.should_dream and self._replay_buffer:
+                    def dream_eval(level_module):
+                        """Evaluate level quality on replay buffer."""
+                        total_loss = 0.0
+                        count = 0
+                        for replay_ids in self._replay_buffer[-3:]:
+                            out = self.model(replay_ids, labels=replay_ids)
+                            total_loss += out["loss"].item()
+                            count += 1
+                        return 1.0 / (1.0 + total_loss / max(count, 1))
+
+                    # Dream across all layers' CMS levels
+                    for layer in self.model.layers:
+                        dream_result = self.dreamer.dream(
+                            layer.cms.levels, dream_eval,
+                        )
                     self.gardener.acknowledge_dream()
 
                 history["signal_health"].append(gard_out.signal_estimate)

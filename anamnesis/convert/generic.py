@@ -120,20 +120,22 @@ def convert_layer_to_hope(
         target_block.o_proj.weight.copy_(attn_src.o_proj.weight)
 
         # Initialize CMS from MLP weights (Section 7.3)
-        # Each CMS level may have different hidden_dim (tapered architecture)
         gate, up, down = extract_mlp_weights(source_layer)
 
-        for level in target_block.cms.levels:
+        for i, level in enumerate(target_block.cms.levels):
             with torch.no_grad():
-                # Truncate or pad pre-trained weights to match level's hidden dim
-                h = min(level.hidden_dim, up.shape[0])
-                d = min(level.dim, up.shape[1])
-                level.up_proj.weight[:h, :d].copy_(up[:h, :d])
-                level.down_proj.weight[:d, :h].copy_(down[:d, :h])
-                # Initialize remaining weights with small values if level is larger
-                if level.hidden_dim > up.shape[0]:
-                    nn.init.normal_(level.up_proj.weight[h:], std=0.01)
-                    nn.init.normal_(level.down_proj.weight[:, h:], std=0.01)
+                if level.swiglu:
+                    # Level 0: exact copy of SwiGLU weights
+                    level.gate_proj.weight.copy_(gate)
+                    level.up_proj.weight.copy_(up)
+                    level.down_proj.weight.copy_(down)
+                else:
+                    # Levels 1+: initialize from truncated pre-trained weights
+                    # These start near-identity (residual_gate ≈ 0)
+                    h = min(level.hidden_dim, up.shape[0])
+                    d = min(level.dim, up.shape[1])
+                    level.up_proj.weight[:h, :d].copy_(up[:h, :d])
+                    level.down_proj.weight[:d, :h].copy_(down[:d, :h])
 
 
 def model_to_hope(
