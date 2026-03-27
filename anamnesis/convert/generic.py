@@ -129,13 +129,26 @@ def convert_layer_to_hope(
                     level.gate_proj.weight.copy_(gate)
                     level.up_proj.weight.copy_(up)
                     level.down_proj.weight.copy_(down)
+                elif hasattr(level, 'memory'):
+                    # DeepMemoryLevel: initialize projections and memory MLP.
+                    # Projections get small random init (Xavier-like).
+                    # Memory MLP starts near-identity (residual MLP, so output ≈ input).
+                    # Output gate starts partially closed (bias=-1 set in __init__).
+                    for name, param in level.named_parameters():
+                        if 'memory' in name and 'weight' in name:
+                            # Memory MLP weights: small init so M(x) ≈ x + small
+                            nn.init.normal_(param, std=0.01)
+                        elif name.startswith('to_') and 'weight' in name:
+                            # Projections: Xavier-scale init
+                            nn.init.normal_(param, std=0.02)
+                elif hasattr(level, 'A'):
+                    # Legacy LowRankLevel (backward compat)
+                    nn.init.normal_(level.A.weight, std=0.02)
+                    nn.init.normal_(level.B.weight, std=0.02)
                 else:
-                    # Levels 1+: initialize from truncated pre-trained weights
-                    # These start near-identity (residual_gate ≈ 0)
-                    h = min(level.hidden_dim, up.shape[0])
-                    d = min(level.dim, up.shape[1])
-                    level.up_proj.weight[:h, :d].copy_(up[:h, :d])
-                    level.down_proj.weight[:d, :h].copy_(down[:d, :h])
+                    # Legacy full-rank residual levels
+                    nn.init.normal_(level.up_proj.weight, std=0.02)
+                    nn.init.zeros_(level.down_proj.weight)
 
 
 def model_to_hope(

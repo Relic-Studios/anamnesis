@@ -56,6 +56,10 @@ class HopeBlock(nn.Module):
         cms_chunk_sizes: list[int] | None = None,
         cms_variant: CMSVariant = CMSVariant.NESTED,
         cms_hidden_mult: float | list[float] = 4.0,
+        cms_rank: int = 32,
+        cms_mem_dim: int = 512,
+        cms_mem_depth: int = 2,
+        cms_poly_degree: int = 2,
         use_neural_memory: bool = False,
         mem_heads: int = 4,
         mem_depth: int = 2,
@@ -91,6 +95,10 @@ class HopeBlock(nn.Module):
             chunk_sizes=cms_chunk_sizes,
             hidden_mult=cms_hidden_mult,
             variant=cms_variant,
+            rank=cms_rank,
+            mem_dim=cms_mem_dim,
+            mem_depth=cms_mem_depth,
+            poly_degree=cms_poly_degree,
         )
 
         # Optional neural memory (Titans-style)

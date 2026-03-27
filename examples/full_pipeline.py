@@ -18,8 +18,6 @@ import time
 from pathlib import Path
 
 import torch
-import torch.nn as nn
-from torch.optim import AdamW
 
 sys.stdout.reconfigure(line_buffering=True)
 
@@ -66,10 +64,89 @@ def generate(model, tokenizer, prompt, device="cuda", max_tokens=100):
 
 
 def gate_mean(model):
+    """Mean base gate value (static sigmoid of residual_gate parameter)."""
     return sum(
         torch.sigmoid(l.cms.levels[1].residual_gate).item()
         for l in model.layers
     ) / len(model.layers)
+
+
+def effective_gate_mean(model):
+    """Mean effective gate value (surprise-modulated, what actually runs during inference)."""
+    total = 0.0
+    with torch.no_grad():
+        for l in model.layers:
+            lv = l.cms.levels[1]
+            total += lv._compute_gate().item()
+    return total / len(model.layers)
+
+
+def surprise_mean(model):
+    """Mean surprise EMA across all layers, both levels."""
+    vals = []
+    for l in model.layers:
+        for lv in l.cms.levels:
+            vals.append(lv._surprise_ema)
+    return sum(vals) / len(vals) if vals else 0.0
+
+
+def _level_params(lv):
+    """Get named parameters for a CMS level (handles both full and low-rank)."""
+    if hasattr(lv, 'A'):  # LowRankLevel
+        return [("A", lv.A.weight), ("B", lv.B.weight)]
+    else:  # CMSLevel
+        params = [("up", lv.up_proj.weight), ("down", lv.down_proj.weight)]
+        if hasattr(lv, 'gate_proj'):
+            params.append(("gate", lv.gate_proj.weight))
+        return params
+
+
+def weight_delta(model, snapshots):
+    """Compute L2 norm of weight change since snapshot across all layers, both levels."""
+    totals = {"lv0": 0.0, "lv1": 0.0}
+    counts = {"lv0": 0, "lv1": 0}
+    for i, layer in enumerate(model.layers):
+        for lvl_idx, lv in enumerate(layer.cms.levels):
+            tag = f"lv{lvl_idx}"
+            for pname, param in _level_params(lv):
+                snap_key = f"layer_{i}_{tag}_{pname}"
+                if snap_key in snapshots:
+                    totals[tag] += (param.data.float() - snapshots[snap_key]).norm().item()
+                    counts[tag] += 1
+    lv0 = totals["lv0"] / max(counts["lv0"], 1)
+    lv1 = totals["lv1"] / max(counts["lv1"], 1)
+    return lv0, lv1
+
+
+def snapshot_weights(model):
+    """Snapshot both level weights for delta tracking."""
+    snaps = {}
+    for i, layer in enumerate(model.layers):
+        for lvl_idx, lv in enumerate(layer.cms.levels):
+            tag = f"lv{lvl_idx}"
+            for pname, param in _level_params(lv):
+                snaps[f"layer_{i}_{tag}_{pname}"] = param.data.float().clone()
+    return snaps
+
+
+def persona_mask(token_ids, im_start_id=151644):
+    """Create a mask weighting assistant tokens 1.0, user tokens 0.1.
+
+    In the Qwen chat format:
+        <|im_start|>user\\n...user...<|im_end|>\\n<|im_start|>assistant\\n...assistant...<|im_end|>
+
+    The second <|im_start|> marks the assistant turn. Everything from there
+    onward is persona-relevant and gets full learning weight.
+    """
+    batch, seq_len = token_ids.shape
+    mask = torch.full((batch, seq_len), 0.1, device=token_ids.device)
+    for b in range(batch):
+        positions = (token_ids[b] == im_start_id).nonzero(as_tuple=True)[0]
+        if len(positions) >= 2:
+            mask[b, positions[-1]:] = 1.0
+        elif len(positions) == 1:
+            mask[b] = 1.0
+    return mask
 
 
 def sample_all(model, tokenizer, prompts, device):
@@ -88,20 +165,27 @@ def print_gens(gens, label=""):
 
 
 def save_cms_evolution_state(model, path):
-    """Save level 1 weights + master weights + gate for all layers."""
+    """Save Level 1 (low-rank) weights only — Level 0 is frozen.
+
+    At rank=32 for a 3B model, each save is ~15MB. This is the "task vector"
+    that encodes everything this instance learned from its environment.
+    """
     state = {}
     for i, layer in enumerate(model.layers):
         lv = layer.cms.levels[1]
-        state[f"layer_{i}"] = {
-            "up_proj": lv.up_proj.weight.data.cpu(),
-            "down_proj": lv.down_proj.weight.data.cpu(),
-            "gate": lv.residual_gate.data.cpu(),
-            "master_up": lv._master_weights.get("up_proj.weight", lv.up_proj.weight.data).cpu(),
-            "master_down": lv._master_weights.get("down_proj.weight", lv.down_proj.weight.data).cpu(),
-            "soul_up": lv._soul_weights.get("up_proj.weight", torch.tensor(0)).cpu(),
-            "soul_down": lv._soul_weights.get("down_proj.weight", torch.tensor(0)).cpu(),
+        lvl_state = {
+            "A": lv.A.weight.data.cpu(),
+            "B": lv.B.weight.data.cpu(),
+            "residual_gate": lv.residual_gate.data.cpu(),
             "total_updates": lv._total_updates,
+            "surprise_ema": lv._surprise_ema,
         }
+        for wname in ["A.weight", "B.weight"]:
+            if wname in lv._master_weights:
+                lvl_state[f"master_{wname}"] = lv._master_weights[wname].cpu()
+            if wname in lv._soul_weights:
+                lvl_state[f"soul_{wname}"] = lv._soul_weights[wname].cpu()
+        state[f"layer_{i}"] = lvl_state
     torch.save(state, path)
 
 
@@ -128,7 +212,10 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
 
     print("=" * 60)
-    print("FULL PIPELINE: Seed -> Evolve -> Persist")
+    print("FULL PIPELINE: Convert -> Evolve -> Persist")
+    print("  No seeding phase. L1 starts at zero-output, gate at 0.5.")
+    print("  Competence-based gating: L1 earns its contribution.")
+    print("  The environment compiles the identity.")
     print("=" * 60)
 
     # ── Load ──
@@ -143,8 +230,6 @@ def main():
         model_name, torch_dtype=torch.bfloat16, device_map=device,
     )
 
-    with open("data/soul_seed.md", encoding="utf-8") as f:
-        soul_text = f.read()
     with open("data/thomas_training.jsonl", encoding="utf-8") as f:
         all_convos = [json.loads(l) for l in f if l.strip()]
 
@@ -160,7 +245,7 @@ def main():
     ]
 
     # ── Convert ──
-    print("\n[1] Converting to 2-level Anamnesis...")
+    print("\n[1] Converting to 2-level Anamnesis (low-rank L1, rank=32)...")
     r = src_config.intermediate_size / src_config.hidden_size
     hope_config = HopeConfig(
         vocab_size=src_config.vocab_size,
@@ -174,7 +259,8 @@ def main():
         cms_levels=2,
         cms_chunk_sizes=[1, 32],
         cms_variant="nested",
-        cms_hidden_mult=[r, r / 2],
+        cms_hidden_mult=[r, r],  # L1 reuses L0's hidden dim for feature extraction
+        cms_rank=32,  # Low-rank L1: ~15MB per specialist
         use_neural_memory=False,
         tie_word_embeddings=False,
     )
@@ -183,93 +269,57 @@ def main():
     torch.cuda.empty_cache()
     model = model.to(device, dtype=torch.bfloat16)
 
-    # Gate to -2
-    with torch.no_grad():
-        for layer in model.layers:
-            layer.cms.levels[1].residual_gate.fill_(-2.0)
+    # L1 starts with zero-output init (down_proj = 0) and gate at sigmoid(0) = 0.5.
+    # Competence-based gating means the gate will close initially (L1 is confused)
+    # and open naturally as L1 learns useful representations from conversation.
+    # No seeding phase needed.
 
     # ── Baseline ──
-    print("\n[2] Baseline...")
+    print("\n[1] Baseline (pre-evolution)...")
     model.eval()
+    # Ensure no predictive coding runs during baseline measurement
+    for layer in model.layers:
+        layer.cms.enable_learning(False)
     baseline_ppl = measure_ppl(model, tokenizer, eval_convos, device)
     baseline_gens = sample_all(model, tokenizer, prompts, device)
     print(f"  PPL: {baseline_ppl:.2f} | Gate: {gate_mean(model):.4f}")
     print(f"  Generations:")
     print_gens(baseline_gens)
 
-    # ══════════════════════════════════════════════════════════
-    # PHASE 1: SEED IDENTITY (short fine-tune, 10 steps)
-    # ══════════════════════════════════════════════════════════
-    print(f"\n{'='*60}")
-    print("[3] PHASE 1: Seeding identity (10 steps on soul document)")
-    print(f"{'='*60}")
-
-    # Freeze everything except level 1
-    for param in model.parameters():
-        param.requires_grad = False
-    for layer in model.layers:
-        lv = layer.cms.levels[1]
-        lv.up_proj.weight.requires_grad = True
-        lv.down_proj.weight.requires_grad = True
-        lv.residual_gate.requires_grad = True
-
-    param_groups = []
-    for layer in model.layers:
-        lv = layer.cms.levels[1]
-        param_groups.append({"params": [lv.up_proj.weight, lv.down_proj.weight], "lr": 1e-4})
-        param_groups.append({"params": [lv.residual_gate], "lr": 5e-2})  # Gate learns fast
-    optimizer = AdamW(param_groups, weight_decay=0.01)
-
-    soul_ids = tokenizer(soul_text, return_tensors="pt")["input_ids"].to(device)
-    model.train()
-
-    for step in range(1, 11):
-        output = model(soul_ids, labels=soul_ids)
-        loss = output["loss"]
-        loss.backward()
-        nn.utils.clip_grad_norm_(
-            [p for pg in param_groups for p in pg["params"]], max_norm=1.0
-        )
-        optimizer.step()
-        optimizer.zero_grad()
-
-        if step % 2 == 0 or step == 1:
-            ppl = math.exp(loss.item()) if loss.item() < 100 else float("inf")
-            print(f"  Step {step:>2}/10 | Loss: {loss.item():.4f} | PPL: {ppl:.1f} | Gate: {gate_mean(model):.4f}")
-
-    # Unfreeze for inference
-    for param in model.parameters():
-        param.requires_grad = False
-
-    # Measure post-seed
-    model.eval()
-    seed_ppl = measure_ppl(model, tokenizer, eval_convos, device)
-    seed_gens = sample_all(model, tokenizer, prompts, device)
-    print(f"\n  Post-seed PPL: {seed_ppl:.2f} (was {baseline_ppl:.2f}, delta: {seed_ppl - baseline_ppl:+.2f})")
-    print(f"  Gate: {gate_mean(model):.4f}")
-    print(f"  Generations:")
-    print_gens(seed_gens)
-
-    # Save soul checkpoint
-    print(f"\n  Saving soul checkpoint...")
+    # Save initial soul checkpoint — the undifferentiated state.
+    # This is what the model returns to if it drifts too far.
+    print(f"\n  Saving soul checkpoint (undifferentiated state)...")
     for layer in model.layers:
         layer.cms.save_soul()
     save_cms_evolution_state(model, output_dir / "soul_checkpoint.pt")
 
+    # Set up persona probes — focus predictive coding on output-relevant directions
+    print(f"\n  Setting up persona probes (SVD of LM head)...")
+    model.setup_persona_probes(persona_dim=256, num_final_layers=4)
+    print(f"  Persona probes active on final 4 layers (256 principal directions)")
+
     # ══════════════════════════════════════════════════════════
-    # PHASE 2: EVOLVE THROUGH CONVERSATION (predictive coding)
+    # EVOLVE THROUGH CONVERSATION (predictive coding)
+    # No seeding. The environment compiles the identity.
     # ══════════════════════════════════════════════════════════
     print(f"\n{'='*60}")
-    print(f"[4] PHASE 2: Evolving through {len(train_convos)} conversations")
+    print(f"[2] Evolving through {len(train_convos)} conversations")
+    print(f"    Competence gate: opens as L1 proves accurate, closes when confused")
+    print(f"    Persona probe: error focused on token-selection directions")
     print(f"{'='*60}")
 
     for layer in model.layers:
-        lv = layer.cms.levels[1]
-        lv.learning_enabled = True
-        lv.lr = 1e-2
+        # Level 0: frozen. Pre-trained MLP provides the base intelligence.
+        layer.cms.levels[0].learning_enabled = False
+
+        # Level 1: the adaptation layer — learns via predictive coding.
+        # Starts at zero output. Gate opens as L1 earns competence.
+        layer.cms.levels[1].learning_enabled = True
+        layer.cms.levels[1].lr = 1e-2
 
     checkpoints = []
     t0 = time.time()
+    pre_evolve_snap = snapshot_weights(model)
 
     for i, convo in enumerate(train_convos):
         text = (
@@ -278,8 +328,11 @@ def main():
         )
         ids = tokenizer(text, max_length=256, truncation=True,
                         return_tensors="pt")["input_ids"].to(device)
+        # Persona mask: learn 10x more from assistant responses than user prompts
+        model.set_learning_weight(persona_mask(ids))
         with torch.no_grad():
             model(ids)
+        model.set_learning_weight(None)
 
         if (i + 1) % 100 == 0:
             # Disable learning for measurement
@@ -288,17 +341,24 @@ def main():
 
             ppl_now = measure_ppl(model, tokenizer, eval_convos, device)
             gens = sample_all(model, tokenizer, prompts, device)
+            dw0, dw1 = weight_delta(model, pre_evolve_snap)
             elapsed = time.time() - t0
 
+            eff_gate = effective_gate_mean(model)
+            surp = surprise_mean(model)
             checkpoints.append({
                 "convos": i + 1, "ppl": round(ppl_now, 2),
-                "gate": round(gate_mean(model), 4),
+                "gate_base": round(gate_mean(model), 4),
+                "gate_effective": round(eff_gate, 4),
+                "surprise_ema": round(surp, 4),
+                "weight_delta_lv0": round(dw0, 6),
+                "weight_delta_lv1": round(dw1, 6),
                 "generations": gens,
             })
 
             name_resp = gens["What's your name?"][:80].encode('ascii', errors='replace').decode()
             self_resp = gens["Tell me about yourself."][:80].encode('ascii', errors='replace').decode()
-            print(f"  [{i+1:>4}] PPL: {ppl_now:.2f} | Gate: {gate_mean(model):.4f} | {elapsed:.0f}s")
+            print(f"  [{i+1:>4}] PPL: {ppl_now:.2f} | Gate(eff): {eff_gate:.4f} | Surp: {surp:.4f} | dw0: {dw0:.4f} dw1: {dw1:.4f} | {elapsed:.0f}s")
             print(f"         Name: {name_resp}")
             print(f"         Self: {self_resp}")
 
@@ -312,10 +372,10 @@ def main():
     final_gens = sample_all(model, tokenizer, prompts, device)
 
     # ══════════════════════════════════════════════════════════
-    # PHASE 3: PERSIST
+    # PERSIST
     # ══════════════════════════════════════════════════════════
     print(f"\n{'='*60}")
-    print("[5] PHASE 3: Saving evolved state")
+    print("[3] Saving evolved state")
     print(f"{'='*60}")
     save_cms_evolution_state(model, output_dir / "evolved_state.pt")
     print(f"  Saved: {output_dir / 'evolved_state.pt'}")
@@ -324,21 +384,25 @@ def main():
     # RESULTS
     # ══════════════════════════════════════════════════════════
     print(f"\n{'='*60}")
-    print("FULL PIPELINE RESULTS")
+    print("PIPELINE RESULTS (no seeding — pure evolution)")
     print(f"{'='*60}")
+    final_dw0, final_dw1 = weight_delta(model, pre_evolve_snap)
+    final_eff_gate = effective_gate_mean(model)
+    final_surprise = surprise_mean(model)
     print(f"  Baseline PPL:     {baseline_ppl:.2f}")
-    print(f"  Post-seed PPL:    {seed_ppl:.2f} (delta: {seed_ppl - baseline_ppl:+.2f})")
     print(f"  Post-evolve PPL:  {final_ppl:.2f} (delta: {final_ppl - baseline_ppl:+.2f})")
-    print(f"  Gate:             {gate_mean(model):.4f}")
+    print(f"  Gate (base):      {gate_mean(model):.4f}")
+    print(f"  Gate (effective): {final_eff_gate:.4f}")
+    print(f"  Surprise EMA:     {final_surprise:.4f}")
+    print(f"  dw level 0 (MLP): {final_dw0:.6f}")
+    print(f"  dw level 1 (res): {final_dw1:.6f}")
 
     print(f"\n  GENERATION EVOLUTION:")
     for p in prompts:
         print(f"\n    Q: {p}")
         b = baseline_gens[p][:100].encode('ascii', errors='replace').decode()
-        s = seed_gens[p][:100].encode('ascii', errors='replace').decode()
         f_ = final_gens[p][:100].encode('ascii', errors='replace').decode()
         print(f"    Baseline:  {b}")
-        print(f"    Seeded:    {s}")
         print(f"    Evolved:   {f_}")
 
     # Check if responses actually changed
@@ -352,11 +416,13 @@ def main():
 
     results = {
         "baseline_ppl": baseline_ppl,
-        "seed_ppl": seed_ppl,
         "final_ppl": final_ppl,
-        "gate_final": gate_mean(model),
+        "gate_base_final": gate_mean(model),
+        "gate_effective_final": final_eff_gate,
+        "surprise_ema_final": final_surprise,
+        "persona_probe": {"dim": 256, "num_layers": 4},
+        "competence_gate": {"scale": model.layers[0].cms.levels[1].gate_surprise_scale},
         "baseline_generations": baseline_gens,
-        "seed_generations": seed_gens,
         "final_generations": final_gens,
         "checkpoints": checkpoints,
     }

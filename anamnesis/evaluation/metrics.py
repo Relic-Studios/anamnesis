@@ -182,6 +182,121 @@ def compute_signal_trajectory(
     return trajectory
 
 
+def _hsic(K: Tensor, L: Tensor) -> Tensor:
+    """Compute the Hilbert-Schmidt Independence Criterion (unbiased estimator)."""
+    n = K.shape[0]
+    H = torch.eye(n, device=K.device, dtype=K.dtype) - 1.0 / n
+    KH = K @ H
+    LH = L @ H
+    return (KH * LH.T).sum() / max((n - 1) ** 2, 1)
+
+
+@torch.no_grad()
+def compute_cka(
+    representations_a: Tensor,
+    representations_b: Tensor,
+) -> float:
+    """
+    Compute Centered Kernel Alignment (CKA) between two sets of representations.
+
+    CKA measures representational similarity between two networks (Kornblith et al., 2019).
+    Use this to measure specialization distance: run the same input through the
+    base Qwen model and the evolved Anamnesis model, compare hidden representations.
+
+    CKA ≈ 0.95 → model hasn't specialized (representations are nearly identical).
+    CKA ≈ 0.70 → structural adaptation has occurred.
+    CKA < 0.50 → significant representational divergence.
+
+    Args:
+        representations_a: Hidden states from model A, shape (n_samples, dim).
+        representations_b: Hidden states from model B, shape (n_samples, dim).
+
+    Returns:
+        CKA similarity score in [0, 1].
+    """
+    # Ensure float32 for numerical stability
+    X = representations_a.float()
+    Y = representations_b.float()
+
+    # Center
+    X = X - X.mean(dim=0, keepdim=True)
+    Y = Y - Y.mean(dim=0, keepdim=True)
+
+    # Linear kernels
+    K = X @ X.T
+    L = Y @ Y.T
+
+    hsic_kl = _hsic(K, L)
+    hsic_kk = _hsic(K, K)
+    hsic_ll = _hsic(L, L)
+
+    denom = (hsic_kk * hsic_ll).sqrt()
+    if denom < 1e-10:
+        return 0.0
+
+    return (hsic_kl / denom).clamp(0, 1).item()
+
+
+@torch.no_grad()
+def compute_layer_cka(
+    model_a: HopeModel,
+    model_b: HopeModel,
+    input_ids: Tensor,
+    layers: list[int] | None = None,
+) -> dict[int, float]:
+    """
+    Compute per-layer CKA between two models on the same input.
+
+    Runs input through both models, extracts hidden states after each
+    transformer block, and computes CKA per layer.
+
+    Args:
+        model_a: Base model (e.g., freshly converted).
+        model_b: Evolved model (after N conversations).
+        input_ids: Shared input, shape (batch, seq_len).
+        layers: Which layers to compare (None = all).
+
+    Returns:
+        Dict mapping layer index to CKA score.
+    """
+    model_a.eval()
+    model_b.eval()
+
+    # Collect hidden states per layer via hooks
+    states_a: dict[int, Tensor] = {}
+    states_b: dict[int, Tensor] = {}
+
+    def make_hook(storage, idx):
+        def hook(module, input, output):
+            h = output[0] if isinstance(output, tuple) else output
+            # Flatten to (n_tokens, dim) for CKA
+            storage[idx] = h.reshape(-1, h.shape[-1]).detach()
+        return hook
+
+    hooks = []
+    target_layers = layers or list(range(len(model_a.layers)))
+
+    for idx in target_layers:
+        hooks.append(model_a.layers[idx].register_forward_hook(make_hook(states_a, idx)))
+        hooks.append(model_b.layers[idx].register_forward_hook(make_hook(states_b, idx)))
+
+    # Forward pass through both
+    model_a(input_ids)
+    model_b(input_ids)
+
+    # Clean up hooks
+    for h in hooks:
+        h.remove()
+
+    # Compute CKA per layer
+    cka_scores = {}
+    for idx in target_layers:
+        if idx in states_a and idx in states_b:
+            cka_scores[idx] = compute_cka(states_a[idx], states_b[idx])
+
+    return cka_scores
+
+
 @torch.no_grad()
 def evaluate_generation(
     model: HopeModel,

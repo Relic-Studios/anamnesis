@@ -39,6 +39,10 @@ class HopeConfig:
     cms_chunk_sizes: list[int] | None = None
     cms_variant: str = "nested"
     cms_hidden_mult: float | list[float] = 5.286  # Qwen's 18944/3584 ratio
+    cms_rank: int = 32  # Legacy (unused with deep memory)
+    cms_mem_dim: int = 512  # Deep memory working dimension
+    cms_mem_depth: int = 2  # Deep memory MLP depth
+    cms_poly_degree: int = 2  # Polynomial feature expansion degree
 
     # Neural memory configuration
     use_neural_memory: bool = False
@@ -102,6 +106,10 @@ class HopeModel(nn.Module):
                 cms_chunk_sizes=config.cms_chunk_sizes,
                 cms_variant=config.cms_variant_enum,
                 cms_hidden_mult=config.cms_hidden_mult,
+                cms_rank=config.cms_rank,
+                cms_mem_dim=config.cms_mem_dim,
+                cms_mem_depth=config.cms_mem_depth,
+                cms_poly_degree=config.cms_poly_degree,
                 use_neural_memory=config.use_neural_memory,
                 mem_heads=config.mem_heads,
                 mem_depth=config.mem_depth,
@@ -178,10 +186,36 @@ class HopeModel(nn.Module):
 
         return result
 
+    def set_learning_weight(self, weight: Tensor | None) -> None:
+        """Set per-position learning weight on all layers' CMS modules."""
+        for layer in self.layers:
+            layer.cms.set_learning_weight(weight)
+
     def enable_drift(self, enabled: bool = True) -> None:
         """Enable/disable neutral drift across all CMS levels in all layers."""
         for layer in self.layers:
             layer.cms.enable_drift(enabled)
+
+    def setup_persona_probes(self, persona_dim: int = 256, num_final_layers: int = 1) -> None:
+        """Set up persona probes on the final N layers' CMS modules.
+
+        Uses SVD of the LM head to focus predictive coding error on the
+        directions in hidden space that most influence token selection.
+        Call after conversion/loading, before evolution.
+
+        Args:
+            persona_dim: Number of principal directions to keep from the LM head.
+            num_final_layers: How many final layers get the persona probe.
+        """
+        # Compute SVD once on CPU and share the probe across all layers
+        lm_head_weight = self.lm_head.weight.data
+        with torch.no_grad():
+            _, _, V = torch.svd_lowrank(lm_head_weight.float().cpu(), q=persona_dim)
+            probe = V.to(lm_head_weight.dtype).to(lm_head_weight.device)
+
+        start = len(self.layers) - num_final_layers
+        for i in range(start, len(self.layers)):
+            self.layers[i].cms.levels[-1]._persona_probe = probe
 
     def num_parameters(self, trainable_only: bool = True) -> int:
         """Count parameters."""

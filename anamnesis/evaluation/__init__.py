@@ -3,6 +3,8 @@ from anamnesis.evaluation.metrics import (
     compute_cms_delta,
     compute_surprise_profile,
     compute_signal_trajectory,
+    compute_cka,
+    compute_layer_cka,
 )
 from anamnesis.evaluation.ablation import AblationConfig, AblationRunner, ABLATION_CONFIGS
 
@@ -11,6 +13,8 @@ __all__ = [
     "compute_cms_delta",
     "compute_surprise_profile",
     "compute_signal_trajectory",
+    "compute_cka",
+    "compute_layer_cka",
     "AblationConfig",
     "AblationRunner",
     "ABLATION_CONFIGS",
