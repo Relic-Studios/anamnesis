@@ -996,6 +996,22 @@ class DeepMemoryLevel(nn.Module):
         self._total_updates = 0
         self._surprise_ema = 1.0
 
+    def reset_to_soul(self) -> bool:
+        """Reset memory MLP weights to soul checkpoint and clear all learning state.
+
+        Returns True if soul checkpoint existed and was restored, False otherwise.
+        """
+        if not self._soul_weights:
+            return False
+        with torch.no_grad():
+            for name, param in self.memory.named_parameters():
+                if name in self._soul_weights:
+                    param.data.copy_(
+                        self._soul_weights[name].to(param.device, dtype=param.dtype)
+                    )
+        self.reset_state()
+        return True
+
     @property
     def surprise(self) -> float:
         if self._total_updates == 0:
