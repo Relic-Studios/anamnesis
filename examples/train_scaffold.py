@@ -89,31 +89,21 @@ def get_trainable_params(model, train_l0=True):
 
 
 def get_data_iterator(tokenizer, seq_len=512, batch_size=4, vessel_data_dir=None):
-    """Stream mixed training data: Wikipedia (90%) + vessel data (10%).
+    """Stream vessel corpus for scaffold training.
 
-    Wikipedia provides clean general knowledge with zero AI identity.
-    Vessel data provides the meta-cognitive framework for identity formation.
+    100% vessel data — no Wikipedia. The base model already has general
+    language knowledge from Qwen pre-training. The scaffold needs to learn
+    the vessel-specific patterns: identity formation, theory of mind,
+    metacognition, reasoning, adaptation.
     """
     import json
     import random
-    from datasets import load_dataset
 
-    # Load Wikipedia stream
-    try:
-        wiki = load_dataset("wikimedia/wikipedia", "20231101.en",
-                            split="train", streaming=True)
-    except Exception as e:
-        print(f"Could not load Wikipedia: {e}")
-        print("Falling back to wikitext-103...")
-        wiki = load_dataset("wikitext", "wikitext-103-raw-v1",
-                            split="train", streaming=True)
-
-    # Load vessel data (meta-cognitive corpus for identity socket formation)
+    # Load vessel data
     vessel_texts = []
     if vessel_data_dir:
         vessel_dir = Path(vessel_data_dir)
         if vessel_dir.exists():
-            # Recursively find all jsonl files
             for jsonl_file in sorted(vessel_dir.rglob("*.jsonl")):
                 with open(jsonl_file, encoding="utf-8") as f:
                     for line in f:
@@ -128,23 +118,24 @@ def get_data_iterator(tokenizer, seq_len=512, batch_size=4, vessel_data_dir=None
                                 continue
             print(f"  Loaded {len(vessel_texts)} vessel passages from {vessel_dir}")
 
+    if not vessel_texts:
+        raise RuntimeError("No vessel data found. Cannot train scaffold.")
+
+    random.shuffle(vessel_texts)
+
     buffer = []
     buffer_tokens = 0
-    vessel_idx = 0
-    mix_counter = 0
+    passage_idx = 0
 
-    for example in wiki:
-        # Mix in vessel data every ~10 Wikipedia passages
-        mix_counter += 1
-        if vessel_texts and mix_counter % 10 == 0:
-            text = vessel_texts[vessel_idx % len(vessel_texts)]
-            vessel_idx += 1
-            if len(text) >= 50:
-                tokens = tokenizer(text, add_special_tokens=False)["input_ids"]
-                buffer.extend(tokens)
-                buffer_tokens += len(tokens)
+    # Infinite loop over vessel data (shuffled each epoch)
+    while True:
+        text = vessel_texts[passage_idx % len(vessel_texts)]
+        passage_idx += 1
 
-        text = example.get("text", "")
+        # Reshuffle at epoch boundary
+        if passage_idx % len(vessel_texts) == 0:
+            random.shuffle(vessel_texts)
+
         if len(text) < 50:
             continue
 
