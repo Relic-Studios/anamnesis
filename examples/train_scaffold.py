@@ -132,7 +132,8 @@ def evaluate(model, tokenizer, device, n_batches=20, seq_len=512):
 
 def test_inner_loop(model, tokenizer, device):
     """Test if the inner loop actually changes behavior after scaffold training."""
-    from examples.train_specialists import (
+    sys.path.insert(0, str(Path(__file__).parent))
+    from train_specialists import (
         SYSTEM_PROMPT_CODE, generate, evolve, reset_model, persona_mask,
     )
 
@@ -276,14 +277,16 @@ def main():
     # ── Optimizer (AdamW, not M3 — simpler for scaffold training) ──
     optimizer = AdamW(trainable_params, lr=args.lr, weight_decay=0.01)
 
-    # Linear warmup + cosine decay
-    def lr_schedule(step):
+    # Manual LR scheduling (simpler, no off-by-one issues)
+    def get_lr(step):
         if step < args.warmup:
-            return step / max(args.warmup, 1)
+            return args.lr * step / max(args.warmup, 1)
         progress = (step - args.warmup) / max(args.steps - args.warmup, 1)
-        return 0.5 * (1.0 + math.cos(math.pi * progress))
+        return args.lr * 0.5 * (1.0 + math.cos(math.pi * progress))
 
-    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_schedule)
+    def set_lr(optimizer, lr):
+        for pg in optimizer.param_groups:
+            pg['lr'] = lr
 
     # ── Baseline eval ──
     print(f"\n[3] Baseline evaluation...")
@@ -313,7 +316,10 @@ def main():
         nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
         optimizer.step()
         optimizer.zero_grad()
-        scheduler.step()
+
+        # Manual LR schedule
+        current_lr = get_lr(step)
+        set_lr(optimizer, current_lr)
 
         losses.append(loss.item())
 
@@ -321,7 +327,7 @@ def main():
             avg_loss = sum(losses[-args.log_every:]) / args.log_every
             ppl = math.exp(avg_loss) if avg_loss < 100 else float("inf")
             elapsed = time.time() - t0
-            lr_now = scheduler.get_last_lr()[0] * args.lr
+            lr_now = current_lr
             tokens_per_sec = (step * args.batch_size * args.seq_len) / elapsed
             print(
                 f"  Step {step:>5}/{args.steps} | Loss: {avg_loss:.4f} | "
