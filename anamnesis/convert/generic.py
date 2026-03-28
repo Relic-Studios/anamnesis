@@ -25,6 +25,70 @@ from anamnesis.core.block import HopeBlock
 from anamnesis.core.model import HopeModel, HopeConfig
 
 
+def _init_deep_memory_from_svd(
+    level: nn.Module,
+    up_weight: Tensor,
+    down_weight: Tensor,
+) -> None:
+    """Initialize DeepMemoryLevel projections from L0's pre-trained SVD.
+
+    Instead of random init (which produces meaningless keys/values), we
+    extract the most important feature directions from L0's existing weights.
+    This gives the memory meaningful inputs from day one — no outer-loop
+    training needed.
+
+    Args:
+        level: DeepMemoryLevel to initialize.
+        up_weight: L0's up_proj weight (hidden_dim, dim).
+        down_weight: L0's down_proj weight (dim, hidden_dim).
+    """
+    mem_dim = level.mem_dim
+
+    with torch.no_grad():
+        # SVD of up_proj: extract top input feature directions
+        # up_weight is (hidden_dim, dim). SVD gives U(hidden,k) S(k) V^T(k, dim)
+        # V^T rows are the most important directions in input space.
+        U_up, S_up, Vt_up = torch.linalg.svd(up_weight.float(), full_matrices=False)
+        # Take top mem_dim directions from input space
+        top_input_dirs = Vt_up[:mem_dim, :]  # (mem_dim, dim)
+
+        # Key and value projections: project input into L0's principal subspace
+        level.to_k.weight.copy_(top_input_dirs.to(level.to_k.weight.dtype))
+        level.to_v.weight.copy_(top_input_dirs.to(level.to_v.weight.dtype))
+        level.to_q.weight.copy_(top_input_dirs.to(level.to_q.weight.dtype))
+
+        # SVD of down_proj: extract top output directions
+        # down_weight is (dim, hidden_dim). SVD gives U(dim,k) S(k) V^T(k, hidden)
+        # U columns are the most important directions in output space.
+        U_down, S_down, Vt_down = torch.linalg.svd(down_weight.float(), full_matrices=False)
+        # out_proj maps mem_dim → dim. Use top output directions scaled by singular values.
+        # Scale gives the projection proportional weight in the residual stream.
+        top_output_dirs = U_down[:, :mem_dim] * S_down[:mem_dim].unsqueeze(0)
+        # Scale so L1 starts as a modest perturbation on L0.
+        top_output_dirs = top_output_dirs * 0.1
+        level.out_proj.weight.copy_(top_output_dirs.to(level.out_proj.weight.dtype))
+
+        # v_expand and mem_out_proj: connect mem_dim <-> poly_dim
+        # Use identity-like init so polynomial features pass through cleanly
+        if hasattr(level, 'v_expand') and not isinstance(level.v_expand, nn.Identity):
+            # v_expand: (poly_dim, mem_dim) — tile the top input directions
+            poly_dim = level.v_expand.weight.shape[0]
+            n_copies = poly_dim // mem_dim
+            v_exp_init = torch.eye(mem_dim).repeat(n_copies, 1) / n_copies
+            level.v_expand.weight.copy_(v_exp_init.to(level.v_expand.weight.dtype))
+
+        if hasattr(level, 'mem_out_proj') and not isinstance(level.mem_out_proj, nn.Identity):
+            # mem_out_proj: (mem_dim, poly_dim) — average across polynomial terms
+            poly_dim = level.mem_out_proj.weight.shape[1]
+            n_copies = poly_dim // mem_dim
+            mop_init = torch.eye(mem_dim).repeat(1, n_copies) / n_copies
+            level.mem_out_proj.weight.copy_(mop_init.to(level.mem_out_proj.weight.dtype))
+
+        # Memory MLP: small init so M(x) ≈ x + small noise
+        for name, param in level.memory.named_parameters():
+            nn.init.normal_(param, std=0.01)
+
+
 def extract_mlp_weights(
     layer: nn.Module,
     gate_name: str = "gate_proj",
@@ -130,17 +194,10 @@ def convert_layer_to_hope(
                     level.up_proj.weight.copy_(up)
                     level.down_proj.weight.copy_(down)
                 elif hasattr(level, 'memory'):
-                    # DeepMemoryLevel: initialize projections and memory MLP.
-                    # Projections get small random init (Xavier-like).
-                    # Memory MLP starts near-identity (residual MLP, so output ≈ input).
-                    # Output gate starts partially closed (bias=-1 set in __init__).
-                    for name, param in level.named_parameters():
-                        if 'memory' in name and 'weight' in name:
-                            # Memory MLP weights: small init so M(x) ≈ x + small
-                            nn.init.normal_(param, std=0.01)
-                        elif name.startswith('to_') and 'weight' in name:
-                            # Projections: Xavier-scale init
-                            nn.init.normal_(param, std=0.02)
+                    # DeepMemoryLevel: initialize projections from L0's SVD.
+                    # This gives the memory meaningful input/output directions
+                    # extracted from the pre-trained MLP — no training needed.
+                    _init_deep_memory_from_svd(level, up, down)
                 elif hasattr(level, 'A'):
                     # Legacy LowRankLevel (backward compat)
                     nn.init.normal_(level.A.weight, std=0.02)

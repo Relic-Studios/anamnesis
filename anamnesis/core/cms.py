@@ -666,7 +666,7 @@ class DeepMemoryLevel(nn.Module):
         dim: int,
         mem_dim: int = 512,
         mem_depth: int = 2,
-        chunk_size: int = 32,
+        chunk_size: int = 64,
         poly_degree: int = 2,
         max_grad_norm: float = 10.0,
         ns_steps: int = 5,
@@ -689,17 +689,19 @@ class DeepMemoryLevel(nn.Module):
         self.to_q = nn.Linear(dim, mem_dim, bias=False)
         self.out_proj = nn.Linear(mem_dim, dim, bias=False)
 
-        # Data-dependent gates (replace broken competence gate)
-        self.to_lr = nn.Linear(dim, 1, bias=True)        # θ_t: learning rate
-        self.to_momentum = nn.Linear(dim, 1, bias=True)   # η_t: momentum decay
-        self.to_decay = nn.Linear(dim, 1, bias=True)      # α_t: forget gate
+        # Data-dependent gates with bias for controlled initialization.
+        # With SVD-initialized projections, the memory has real influence —
+        # learning rate must start moderate to avoid destroying coherence.
+        self.to_lr = nn.Linear(dim, 1, bias=True)          # θ_t: learning rate
+        self.to_momentum = nn.Linear(dim, 1, bias=True)    # η_t: momentum decay
+        self.to_decay = nn.Linear(dim, 1, bias=True)       # α_t: forget gate
         self.to_output_gate = nn.Linear(dim, 1, bias=True) # output contribution
 
-        # Initialize gate biases for safe startup
-        nn.init.constant_(self.to_lr.bias, -4.0)           # sigmoid(-4) ≈ 0.018
-        nn.init.constant_(self.to_momentum.bias, 1.0)      # sigmoid(1) ≈ 0.73
+        # Gate biases
+        nn.init.constant_(self.to_lr.bias, -2.0)           # sigmoid(-2) ≈ 0.12
+        nn.init.constant_(self.to_momentum.bias, 0.0)      # sigmoid(0) = 0.5
         nn.init.constant_(self.to_decay.bias, -3.0)        # sigmoid(-3) ≈ 0.05 (low forgetting)
-        nn.init.constant_(self.to_output_gate.bias, -1.0)  # sigmoid(-1) ≈ 0.27 (start partially closed)
+        nn.init.constant_(self.to_output_gate.bias, 0.0)   # sigmoid(0) = 0.5
 
         # The memory: deep MLP whose weights are the learned specialization
         # Operates in poly_dim space (mem_dim * poly_degree)
@@ -755,91 +757,93 @@ class DeepMemoryLevel(nn.Module):
         raw = functional_call(self.memory, params, (queries,))
         return self.mem_out_proj(raw)
 
-    def _compute_chunk_gradients(
+    def _compute_per_token_gradients(
         self,
         keys: Tensor,
         values: Tensor,
         params: dict[str, Tensor],
     ) -> dict[str, Tensor]:
-        """Compute per-sample gradients for a chunk via vmap+grad.
+        """Compute per-token gradients for a chunk via vmap+grad.
 
-        This is the core ATLAS mechanism: gradient of ‖M(k)-v‖² w.r.t.
-        memory MLP weights, vectorized across all samples in the chunk.
+        Gradient of ‖M(k)-v‖² w.r.t. memory MLP weights, vectorized
+        across all tokens in the chunk. Returns per-token gradients
+        (not averaged) for sequential momentum updates.
 
         Args:
-            keys: Polynomial-expanded keys (batch*chunk, poly_dim).
-            values: Target values (batch*chunk, mem_dim).
+            keys: Polynomial-expanded keys (n_tokens, poly_dim).
+            values: Target values (n_tokens, poly_dim).
             params: Current memory parameters.
 
         Returns:
-            Dict of chunk-averaged gradients per parameter.
+            Dict of per-token gradients {name: (n_tokens, *param_shape)}.
         """
         n = keys.shape[0]
 
-        # Expand params for vmap: each sample uses same params
+        # Expand params for vmap: each token uses same params
         expanded_params = {
             name: p.unsqueeze(0).expand(n, *p.shape)
             for name, p in params.items()
         }
 
-        # Per-sample gradient computation
+        # Per-token gradient computation
         grad_fn = grad(_memory_loss_fn, argnums=0)
         batched_grad_fn = vmap(grad_fn, in_dims=(0, None, 0, 0))
-        per_sample_grads = batched_grad_fn(expanded_params, self.memory, keys, values)
+        per_token_grads = batched_grad_fn(expanded_params, self.memory, keys, values)
 
-        # Average over the chunk (Omega Rule: optimize over window, not single token)
-        avg_grads = {}
-        for name, g in per_sample_grads.items():
-            # Clip per-sample gradient norms for stability
-            g_flat = g.reshape(n, -1)
-            g_norms = g_flat.norm(dim=1, keepdim=True).clamp(min=1e-8)
-            scale = (g_norms / self.max_grad_norm).clamp(min=1.0)
-            g_clipped = g / scale.view(n, *([1] * (g.dim() - 1)))
-            avg_grads[name] = g_clipped.mean(dim=0)  # average over chunk
+        return per_token_grads
 
-        return avg_grads
-
-    def _apply_momentum_update(
+    def _apply_per_token_update(
         self,
         params: dict[str, Tensor],
-        grads: dict[str, Tensor],
-        lr: float,
-        momentum_decay: float,
-        forget_gate: float,
+        per_sample_grads: dict[str, Tensor],
+        lr: Tensor,
+        momentum_decay: Tensor,
+        forget_gate: Tensor,
     ) -> dict[str, Tensor]:
-        """Apply Titans/ATLAS momentum update with NS-5.
+        """Apply Titans momentum update per-token (Equations 13-14).
 
-        S_t = η·S_{t-1} - θ·grad          [surprise momentum]
-        S_orth = NS5(S) * θ                [orthogonalize, then scale by lr]
-        M_t = (1-α)·M_{t-1} + S_orth       [update with forget gate]
+        For each token t in the chunk:
+            S_t = η_t · S_{t-1} - θ_t · ∇ℓ_t
+            M_t = (1 - α_t) · M_{t-1} + S_t
 
-        NS-5 normalizes momentum to unit spectral norm. The learning rate θ
-        then controls the actual step size. Without this scaling, NS-5 output
-        would dominate the weights (unit norm >> typical weight magnitudes).
+        No NS-5. No chunk averaging. Per-token sequential updates.
+        This matches the working NeuralMemory implementation exactly.
+
+        Args:
+            params: Current memory weights {name: Tensor}.
+            per_sample_grads: Per-token gradients {name: (n_tokens, *param_shape)}.
+            lr: Learning rate per token (n_tokens, 1).
+            momentum_decay: Momentum decay per token (n_tokens, 1).
+            forget_gate: Forget gate per token (n_tokens, 1).
         """
-        updated = {}
-        for name, p in params.items():
-            g = grads.get(name)
-            if g is None:
-                updated[name] = p
-                continue
+        n_tokens = lr.shape[0]
+        updated = {name: p.clone() for name, p in params.items()}
 
-            # Initialize momentum if needed
-            if name not in self._momentum_state:
-                self._momentum_state[name] = torch.zeros_like(p)
+        for t in range(n_tokens):
+            lr_t = lr[t]        # scalar-ish (1,)
+            eta_t = momentum_decay[t]
+            alpha_t = forget_gate[t]
 
-            # Surprise momentum: S = η·S_prev - θ·grad
-            s = momentum_decay * self._momentum_state[name] - lr * g
-            self._momentum_state[name] = s.detach()
+            for name in updated:
+                if name not in per_sample_grads:
+                    continue
+                g_t = per_sample_grads[name][t]  # (*param_shape)
 
-            # NS-5 orthogonalization on 2D weight matrices, scaled by lr
-            if s.dim() >= 2 and min(s.shape) > 1:
-                s_orth = newton_schulz(s, steps=self.ns_steps) * lr
-            else:
-                s_orth = s
+                # Gradient clipping
+                g_norm = g_t.norm()
+                if g_norm > self.max_grad_norm:
+                    g_t = g_t * (self.max_grad_norm / g_norm)
 
-            # Weight update with forget gate: M = (1-α)·M_prev + S_orth
-            updated[name] = (1.0 - forget_gate) * p + s_orth
+                # Initialize momentum if needed
+                if name not in self._momentum_state:
+                    self._momentum_state[name] = torch.zeros_like(g_t)
+
+                # Surprise momentum: S_t = η_t · S_{t-1} - θ_t · ∇ℓ
+                s = eta_t * self._momentum_state[name] - lr_t * g_t
+                self._momentum_state[name] = s
+
+                # Weight update: M_t = (1 - α_t) · M_{t-1} + S_t
+                updated[name] = (1.0 - alpha_t) * updated[name] + s
 
         return updated
 
@@ -892,7 +896,7 @@ class DeepMemoryLevel(nn.Module):
             retrieval = self._retrieve(q_chunk, params)
             all_retrievals.append(retrieval)
 
-            # PHASE 2: STORE (compute gradients and update weights)
+            # PHASE 2: STORE (compute gradients and update weights per-token)
             if torch.is_grad_enabled():
                 # During backprop training, don't update memory weights
                 continue
@@ -903,36 +907,56 @@ class DeepMemoryLevel(nn.Module):
             # Expand values to poly_dim for loss computation
             v_expanded = self.v_expand(v_chunk)
 
-            # Flatten batch and chunk for vmap
-            k_flat = k_chunk.reshape(-1, k_chunk.shape[-1])
+            # Flatten batch and chunk for vmap — treats each (batch, position) as one token
+            k_flat = k_chunk.reshape(-1, k_chunk.shape[-1])  # (batch*chunk, poly_dim)
             v_flat = v_expanded.reshape(-1, v_expanded.shape[-1])
 
-            # Per-sample gradients averaged over chunk (Omega Rule)
-            chunk_grads = self._compute_chunk_gradients(k_flat, v_flat, params)
+            # Per-token gradients via vmap+grad
+            token_grads = self._compute_per_token_gradients(k_flat, v_flat, params)
 
-            # Apply persona probe to gradients
-            if self._persona_probe is not None:
-                chunk_grads = self._project_grads_persona(chunk_grads)
+            # OMEGA RULE: average gradients over the chunk, apply ONE update.
+            # This is c-token context-aware optimization, not per-token noise.
+            n_tokens = k_flat.shape[0]
+            avg_grads = {}
+            for name, g in token_grads.items():
+                avg_grads[name] = g.mean(dim=0)  # average over chunk tokens
 
             # Chunk-averaged gate values
-            avg_lr = lr_raw[:, chunk_start:chunk_end].mean().item()
-            avg_mom = mom_raw[:, chunk_start:chunk_end].mean().item()
-            avg_decay = decay_raw[:, chunk_start:chunk_end].mean().item()
+            avg_lr = lr_raw[:, chunk_start:chunk_end].mean()
+            avg_mom = mom_raw[:, chunk_start:chunk_end].mean()
+            avg_decay = decay_raw[:, chunk_start:chunk_end].mean()
 
             # Track surprise (for monitoring)
-            grad_norm = sum(g.norm().item() for g in chunk_grads.values())
-            self._surprise_ema = 0.95 * self._surprise_ema + 0.05 * grad_norm
+            total_grad_norm = sum(g.norm().item() for g in avg_grads.values())
+            self._surprise_ema = 0.95 * self._surprise_ema + 0.05 * total_grad_norm
 
-            # Momentum update with NS-5
-            params = self._apply_momentum_update(
-                params, chunk_grads, avg_lr, avg_mom, avg_decay,
-            )
+            # Single momentum update per chunk (Omega Rule)
+            for name, p in params.items():
+                g = avg_grads.get(name)
+                if g is None:
+                    continue
+                # Gradient clipping
+                g_norm = g.norm()
+                if g_norm > self.max_grad_norm:
+                    g = g * (self.max_grad_norm / g_norm)
+                # Initialize momentum
+                if name not in self._momentum_state:
+                    self._momentum_state[name] = torch.zeros_like(g)
+                # S = η·S_prev - θ·grad
+                s = avg_mom * self._momentum_state[name] - avg_lr * g
+                self._momentum_state[name] = s
+                # M = (1-α)·M_prev + S
+                params[name] = (1.0 - avg_decay) * p + s
 
             # Soul pull-back
             if self._soul_weights:
                 params = self._soul_pullback(params)
 
-            self._total_updates += 1
+            self._total_updates += chunk_len
+
+            # NOTE: Projections (to_k, to_v, out_proj) stay fixed at SVD init.
+            # They provide meaningful input/output directions from pre-trained weights.
+            # Only the memory MLP content adapts during inference.
 
         # Write updated params back to the memory module
         if not torch.is_grad_enabled():
@@ -953,6 +977,98 @@ class DeepMemoryLevel(nn.Module):
                 out = out + torch.randn_like(out) * self.drift_sigma
 
         return out
+
+    @torch.no_grad()
+    def _update_projections(
+        self,
+        x_chunk: Tensor,
+        v_chunk: Tensor,
+        memory_params: dict[str, Tensor],
+    ) -> None:
+        """Update projection weights using the same associative loss.
+
+        Projections learn WHAT to project. Memory learns WHAT to remember.
+        Same signal, 10x slower rate. No separate training phase needed.
+
+        Uses analytical gradients (not autograd) for the projection update:
+            loss = mean ||M(phi(k)) - v_expanded||^2
+            k = normalize(to_k(x))
+            grad_to_k = d_loss/d_to_k  (chain rule through normalize + phi + M)
+
+        For simplicity, we compute a first-order approximation:
+        the error at the memory output tells us which direction the keys
+        should move, and we propagate that back through the projections.
+        """
+        batch, chunk_len, dim = x_chunk.shape
+        proj_lr = 0.001  # 10-50x slower than memory updates
+
+        # Recompute forward through projections to get intermediates
+        k = F.normalize(self.to_k(x_chunk), dim=-1)
+        v = self.to_v(x_chunk)
+        k_poly = self._poly_expand(k)
+        v_expanded = self.v_expand(v)
+
+        # Flatten
+        k_flat = k_poly.reshape(-1, k_poly.shape[-1])
+        v_flat = v_expanded.reshape(-1, v_expanded.shape[-1])
+
+        # Compute memory predictions with current params
+        pred = functional_call(self.memory, memory_params, (k_flat,))
+        err = pred - v_flat  # (n, poly_dim)
+        n = k_flat.shape[0]
+
+        # Gradient for out_proj: how should the output projection change?
+        # out_proj maps mem_dim -> dim. The error in the output space tells us.
+        # We use the retrieval error projected back through mem_out_proj.
+        retrieved = self.mem_out_proj(pred.reshape(batch, chunk_len, -1))
+        v_target = v.detach()
+        out_err = (retrieved - v_target)  # (batch, chunk_len, mem_dim)
+        out_err_flat = out_err.reshape(-1, self.mem_dim)
+        x_flat = x_chunk.reshape(-1, dim)
+
+        # out_proj gradient: d_loss/d_out_proj = err^T @ retrieved / n
+        # This updates the output projection to reduce reconstruction error
+        out_grad = (out_err_flat.T @ self.mem_out_proj(pred).reshape(-1, self.mem_dim)) / n
+        if out_grad.shape == self.out_proj.weight.shape:
+            g_norm = out_grad.norm()
+            if g_norm > self.max_grad_norm:
+                out_grad = out_grad * (self.max_grad_norm / g_norm)
+            self.out_proj.weight.data.sub_(out_grad.to(self.out_proj.weight.dtype), alpha=proj_lr)
+
+        # to_v gradient: the value projection should produce values that
+        # the memory can reconstruct. Error = M(k) - v_expanded.
+        # d_loss/d_to_v flows through v_expand and the MSE.
+        # Simplified: move to_v in the direction that reduces ||M(k) - v_expand(to_v(x))||
+        v_err = self.v_expand(v).reshape(-1, v_expanded.shape[-1]) - pred.detach()
+        v_grad = (v_err.T @ x_flat) / n  # (poly_dim, dim)
+        # Project back to to_v shape through v_expand
+        if hasattr(self.v_expand, 'weight'):
+            tv_grad = (self.v_expand.weight.T @ v_grad)  # (mem_dim, dim)
+        else:
+            tv_grad = v_grad[:self.mem_dim]
+        if tv_grad.shape == self.to_v.weight.shape:
+            g_norm = tv_grad.norm()
+            if g_norm > self.max_grad_norm:
+                tv_grad = tv_grad * (self.max_grad_norm / g_norm)
+            self.to_v.weight.data.add_(tv_grad.to(self.to_v.weight.dtype), alpha=proj_lr)
+
+        # to_k gradient: keys should be projected so M(phi(k)) ≈ v.
+        # Error = M(phi(k)) - v_expanded. Backprop through M is complex,
+        # but we can use a first-order approximation: move keys toward
+        # values in the memory space.
+        # Use the memory error to nudge key projections.
+        k_err_signal = err.reshape(-1, err.shape[-1])  # (n, poly_dim)
+        # Backprop through poly_expand is: for degree 2, d_phi/d_k = [I, 2*diag(k)]
+        # Simplified: just use the first mem_dim components (linear term)
+        k_grad_signal = k_err_signal[:, :self.mem_dim]  # (n, mem_dim)
+        tk_grad = (k_grad_signal.T @ x_flat) / n  # (mem_dim, dim)
+        if tk_grad.shape == self.to_k.weight.shape:
+            g_norm = tk_grad.norm()
+            if g_norm > self.max_grad_norm:
+                tk_grad = tk_grad * (self.max_grad_norm / g_norm)
+            self.to_k.weight.data.sub_(tk_grad.to(self.to_k.weight.dtype), alpha=proj_lr)
+            # to_q tracks to_k (queries should search the same space as keys)
+            self.to_q.weight.data.copy_(self.to_k.weight.data)
 
     def _project_grads_persona(self, grads: dict[str, Tensor]) -> dict[str, Tensor]:
         """Project gradients through persona probe to focus on output-relevant directions."""

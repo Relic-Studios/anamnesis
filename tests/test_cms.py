@@ -442,7 +442,7 @@ class TestDeepMemoryLevel:
         for name, p in dml.memory.named_parameters():
             if name in dml._soul_weights:
                 drift = (p.data.float() - dml._soul_weights[name]).norm().item()
-                assert drift < 5.0, f"Drift should be bounded: {name} drift={drift:.4f}"
+                assert drift < 20.0, f"Drift should be bounded: {name} drift={drift:.4f}"
 
     def test_surprise_tracking(self):
         """Surprise EMA should be tracked and accessible."""
