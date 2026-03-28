@@ -38,35 +38,54 @@ import warnings
 warnings.filterwarnings("ignore", category=FutureWarning)
 
 
-def get_trainable_params(model):
-    """Get only the DeepMemoryLevel parameters (everything else frozen)."""
-    from anamnesis.core.cms import DeepMemoryLevel
-    trainable = []
+def get_trainable_params(model, train_l0=True):
+    """Get trainable parameters. L0 trains at low LR, DeepMemoryLevels at full LR.
+
+    Returns two param groups for the optimizer:
+    - L0 params (SwiGLU MLP): low learning rate, gentle adaptation
+    - DeepMemoryLevel params: full learning rate, learn the plumbing
+
+    During scaffold training, L0 adapts to work WITH the memory system.
+    During inference, L0 is frozen (same vessel for everyone).
+    """
+    from anamnesis.core.cms import DeepMemoryLevel, CMSLevel
+
+    l0_params = []
+    deep_mem_params = []
+    frozen_params = []
+    l0_count = 0
+    deep_mem_count = 0
     frozen_count = 0
-    trainable_count = 0
 
     for name, param in model.named_parameters():
-        # Check if this parameter belongs to a DeepMemoryLevel
+        # Walk module tree to find what this param belongs to
         is_deep_memory = False
-        parts = name.split('.')
-        # Walk the module tree to check if any parent is DeepMemoryLevel
+        is_l0 = False
         module = model
+        parts = name.split('.')
         for part in parts[:-1]:
             if hasattr(module, part):
                 module = getattr(module, part)
                 if isinstance(module, DeepMemoryLevel):
                     is_deep_memory = True
                     break
+                if isinstance(module, CMSLevel) and module.swiglu:
+                    is_l0 = True
+                    break
 
         if is_deep_memory:
             param.requires_grad = True
-            trainable.append(param)
-            trainable_count += param.numel()
+            deep_mem_params.append(param)
+            deep_mem_count += param.numel()
+        elif is_l0 and train_l0:
+            param.requires_grad = True
+            l0_params.append(param)
+            l0_count += param.numel()
         else:
             param.requires_grad = False
             frozen_count += param.numel()
 
-    return trainable, trainable_count, frozen_count
+    return l0_params, deep_mem_params, l0_count, deep_mem_count, frozen_count
 
 
 def get_data_iterator(tokenizer, seq_len=512, batch_size=4, vessel_data_dir=None):
@@ -89,19 +108,22 @@ def get_data_iterator(tokenizer, seq_len=512, batch_size=4, vessel_data_dir=None
         wiki = load_dataset("wikitext", "wikitext-103-raw-v1",
                             split="train", streaming=True)
 
-    # Load vessel data (our generated meta-cognitive corpus)
+    # Load vessel data (meta-cognitive corpus for identity socket formation)
     vessel_texts = []
     if vessel_data_dir:
         vessel_dir = Path(vessel_data_dir)
         if vessel_dir.exists():
-            for jsonl_file in vessel_dir.glob("*.jsonl"):
+            # Recursively find all jsonl files
+            for jsonl_file in sorted(vessel_dir.rglob("*.jsonl")):
                 with open(jsonl_file, encoding="utf-8") as f:
                     for line in f:
                         line = line.strip()
                         if line:
                             try:
                                 obj = json.loads(line)
-                                vessel_texts.append(obj.get("text", ""))
+                                text = obj.get("text", obj.get("content", ""))
+                                if text and len(str(text)) > 20:
+                                    vessel_texts.append(str(text))
                             except json.JSONDecodeError:
                                 continue
             print(f"  Loaded {len(vessel_texts)} vessel passages from {vessel_dir}")
@@ -222,7 +244,7 @@ def test_inner_loop(model, tokenizer, device):
 
 def main():
     parser = argparse.ArgumentParser(description="Train DeepMemoryLevel scaffold")
-    parser.add_argument("--model", default="Qwen/Qwen2.5-0.5B-Instruct")
+    parser.add_argument("--model", default="Qwen/Qwen2.5-7B")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--steps", type=int, default=5000)
     parser.add_argument("--batch-size", type=int, default=4)
@@ -278,10 +300,10 @@ def main():
         max_position_embeddings=getattr(src_config, "max_position_embeddings", 32768),
         rope_theta=getattr(src_config, "rope_theta", 1_000_000.0),
         rms_norm_eps=getattr(src_config, "rms_norm_eps", 1e-6),
-        cms_levels=2,
-        cms_chunk_sizes=[1, 64],
+        cms_levels=5,
+        cms_chunk_sizes=[1, 1, 32, 256, 2048],
         cms_variant="nested",
-        cms_hidden_mult=[r, r],
+        cms_hidden_mult=[r, r, r, r, r],
         cms_mem_dim=512 if src_config.hidden_size >= 2048 else 256,
         cms_mem_depth=2,
         cms_poly_degree=2,
@@ -294,12 +316,14 @@ def main():
     torch.cuda.empty_cache()
     model = model.to(args.device, dtype=torch.bfloat16)
 
-    # ── Freeze everything except DeepMemoryLevel ──
-    print(f"\n[2] Freezing attention + L0, training only DeepMemoryLevel...")
-    trainable_params, trainable_count, frozen_count = get_trainable_params(model)
-    print(f"  Trainable: {trainable_count:,} params ({trainable_count/1e6:.1f}M)")
-    print(f"  Frozen:    {frozen_count:,} params ({frozen_count/1e6:.1f}M)")
-    print(f"  Ratio:     {trainable_count/(trainable_count+frozen_count)*100:.1f}% trainable")
+    # ── Setup trainable params: L0 at low LR + DeepMemoryLevels at full LR ──
+    print(f"\n[2] Setting up training: L0 (low LR) + DeepMemoryLevels (full LR)...")
+    l0_params, deep_mem_params, l0_count, deep_mem_count, frozen_count = get_trainable_params(model, train_l0=True)
+    total_trainable = l0_count + deep_mem_count
+    print(f"  L0 (SwiGLU):       {l0_count:,} params ({l0_count/1e6:.1f}M) @ lr={args.lr/10:.1e}")
+    print(f"  DeepMemoryLevels:  {deep_mem_count:,} params ({deep_mem_count/1e6:.1f}M) @ lr={args.lr:.1e}")
+    print(f"  Frozen (attention): {frozen_count:,} params ({frozen_count/1e6:.1f}M)")
+    print(f"  Total trainable:   {total_trainable/(total_trainable+frozen_count)*100:.1f}%")
 
     if args.checkpoint:
         print(f"  Loading checkpoint: {args.checkpoint}")
@@ -314,7 +338,10 @@ def main():
         return
 
     # ── Optimizer (AdamW, not M3 — simpler for scaffold training) ──
-    optimizer = AdamW(trainable_params, lr=args.lr, weight_decay=0.01)
+    optimizer = AdamW([
+        {"params": l0_params, "lr": args.lr / 10},       # L0: gentle adaptation
+        {"params": deep_mem_params, "lr": args.lr},        # DeepMemory: full speed
+    ], weight_decay=0.01)
 
     # LR schedule: warmup → hold → gentle decay to 10% (not zero)
     # Cosine to zero killed learning in the second half of training.
@@ -343,7 +370,10 @@ def main():
     for layer in model.layers:
         layer.cms.enable_learning(False)
 
-    vessel_dir = str(Path(__file__).parent.parent / "data" / "scaffold_training")
+    # Try anima corpus first, fall back to local scaffold data
+    anima_dir = Path("C:/Dev/anima/data/training")
+    local_dir = Path(__file__).parent.parent / "data" / "scaffold_training"
+    vessel_dir = str(anima_dir if anima_dir.exists() else local_dir)
     data_iter = get_data_iterator(tokenizer, seq_len=args.seq_len, batch_size=args.batch_size,
                                   vessel_data_dir=vessel_dir)
     t0 = time.time()
@@ -358,7 +388,7 @@ def main():
         loss = output["loss"]
 
         loss.backward()
-        nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
+        nn.utils.clip_grad_norm_(l0_params + deep_mem_params, max_norm=1.0)
         optimizer.step()
         optimizer.zero_grad()
 

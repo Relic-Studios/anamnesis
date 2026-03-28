@@ -1,51 +1,48 @@
 #!/bin/bash
-# Anamnesis 7B Scaffold Training on RunPod
-# GPU: 1x A100 80GB (~$0.80/hr, ~3 hours = ~$2.50)
+# Anamnesis 7B Vessel Training on RunPod
+# GPU: 1x A100 80GB
 #
-# SSH into your RunPod instance and run:
-#   bash runpod_train.sh
+# Architecture: 5 levels (L0 frozen SwiGLU + 4 DeepMemoryLevels)
+# Base model: Qwen 2.5 7B (NOT Instruct — empty vessel)
+# L0 trains at 1/10th LR to become part of the vessel
+# Data: Wikipedia + vessel corpus (soul_vessel, theory_of_mind, metacognition)
 
 set -e
 
 echo "============================================================"
-echo "  Anamnesis 7B Scaffold Training"
-echo "  Teaching the memory how to learn"
+echo "  Anamnesis 7B Vessel Training (Base Model + 4 Memory Levels)"
 echo "============================================================"
 
-# Setup
 cd /workspace
 if [ ! -d "anamnesis" ]; then
     git clone https://github.com/Relic-Studios/anamnesis.git
 fi
 cd anamnesis
 git pull
+pip install -e .
+pip install -q transformers accelerate datasets
 
-# Install deps
-pip install -q torch transformers datasets safetensors
+# Copy vessel corpus if available locally, otherwise it loads from repo
+if [ -d "/workspace/vessel_data" ]; then
+    echo "Using local vessel corpus"
+    VESSEL_DIR="/workspace/vessel_data"
+else
+    echo "Using repo vessel corpus"
+    VESSEL_DIR="data/scaffold_training"
+fi
 
-# Verify GPU
-python -c "
-import torch
-print(f'GPU: {torch.cuda.get_device_name(0)}')
-print(f'VRAM: {torch.cuda.get_device_properties(0).total_memory/1e9:.1f} GB')
-"
+python -c "import torch; print(f'GPU: {torch.cuda.get_device_name(0)}'); print(f'VRAM: {torch.cuda.get_device_properties(0).total_memory/1e9:.1f} GB')"
 
-# Train
 python examples/train_scaffold.py \
-    --model Qwen/Qwen2.5-7B-Instruct \
-    --steps 50000 \
-    --batch-size 8 \
-    --seq-len 512 \
-    --lr 1e-3 \
+    --model Qwen/Qwen2.5-7B \
+    --steps 25000 \
+    --batch-size 4 \
+    --lr 3e-4 \
     --warmup 500 \
-    --log-every 100 \
-    --save-every 5000 \
-    --eval-every 2500 \
-    --output-dir /workspace/scaffold_7b \
+    --output-dir /workspace/vessel_7b \
     --test-inner-loop
 
 echo ""
 echo "============================================================"
-echo "  Training complete. Results in /workspace/scaffold_7b/"
-echo "  Download final.pt and results.json"
+echo "  Training complete. Download /workspace/vessel_7b/final.pt"
 echo "============================================================"
