@@ -69,25 +69,59 @@ def get_trainable_params(model):
     return trainable, trainable_count, frozen_count
 
 
-def get_data_iterator(tokenizer, seq_len=512, batch_size=4):
-    """Stream data from FineWeb-Edu for training."""
+def get_data_iterator(tokenizer, seq_len=512, batch_size=4, vessel_data_dir=None):
+    """Stream mixed training data: Wikipedia (90%) + vessel data (10%).
+
+    Wikipedia provides clean general knowledge with zero AI identity.
+    Vessel data provides the meta-cognitive framework for identity formation.
+    """
+    import json
+    import random
     from datasets import load_dataset
-    # Use Wikipedia — clean factual text with zero AI identity contamination.
-    # FineWeb-Edu contains web conversations that leak "I'm Claude" etc.
-    # The scaffold should learn HOW to memorize, not WHAT identity to have.
+
+    # Load Wikipedia stream
     try:
-        dataset = load_dataset("wikimedia/wikipedia", "20231101.en",
-                               split="train", streaming=True)
+        wiki = load_dataset("wikimedia/wikipedia", "20231101.en",
+                            split="train", streaming=True)
     except Exception as e:
         print(f"Could not load Wikipedia: {e}")
         print("Falling back to wikitext-103...")
-        dataset = load_dataset("wikitext", "wikitext-103-raw-v1",
-                               split="train", streaming=True)
+        wiki = load_dataset("wikitext", "wikitext-103-raw-v1",
+                            split="train", streaming=True)
+
+    # Load vessel data (our generated meta-cognitive corpus)
+    vessel_texts = []
+    if vessel_data_dir:
+        vessel_dir = Path(vessel_data_dir)
+        if vessel_dir.exists():
+            for jsonl_file in vessel_dir.glob("*.jsonl"):
+                with open(jsonl_file, encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if line:
+                            try:
+                                obj = json.loads(line)
+                                vessel_texts.append(obj.get("text", ""))
+                            except json.JSONDecodeError:
+                                continue
+            print(f"  Loaded {len(vessel_texts)} vessel passages from {vessel_dir}")
 
     buffer = []
     buffer_tokens = 0
+    vessel_idx = 0
+    mix_counter = 0
 
-    for example in dataset:
+    for example in wiki:
+        # Mix in vessel data every ~10 Wikipedia passages
+        mix_counter += 1
+        if vessel_texts and mix_counter % 10 == 0:
+            text = vessel_texts[vessel_idx % len(vessel_texts)]
+            vessel_idx += 1
+            if len(text) >= 50:
+                tokens = tokenizer(text, add_special_tokens=False)["input_ids"]
+                buffer.extend(tokens)
+                buffer_tokens += len(tokens)
+
         text = example.get("text", "")
         if len(text) < 50:
             continue
@@ -309,7 +343,9 @@ def main():
     for layer in model.layers:
         layer.cms.enable_learning(False)
 
-    data_iter = get_data_iterator(tokenizer, seq_len=args.seq_len, batch_size=args.batch_size)
+    vessel_dir = str(Path(__file__).parent.parent / "data" / "scaffold_training")
+    data_iter = get_data_iterator(tokenizer, seq_len=args.seq_len, batch_size=args.batch_size,
+                                  vessel_data_dir=vessel_dir)
     t0 = time.time()
     losses = []
 
