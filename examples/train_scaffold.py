@@ -199,13 +199,19 @@ def main():
     parser.add_argument("--log-every", type=int, default=50)
     parser.add_argument("--save-every", type=int, default=1000)
     parser.add_argument("--eval-every", type=int, default=500)
-    parser.add_argument("--output-dir", default="data/scaffold_0.5b")
+    parser.add_argument("--output-dir", default="")
+    parser.add_argument("--gradient-checkpointing", action="store_true",
+                        help="Use gradient checkpointing to reduce VRAM (slower but fits larger models)")
     parser.add_argument("--eval-only", action="store_true")
     parser.add_argument("--checkpoint", default="")
     parser.add_argument("--test-inner-loop", action="store_true",
                         help="After training, test if inner loop works")
     args = parser.parse_args()
 
+    # Auto-name output dir from model
+    if not args.output_dir:
+        model_short = args.model.split("/")[-1].lower().replace("-instruct", "").replace(".", "_")
+        args.output_dir = f"data/scaffold_{model_short}"
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -243,7 +249,7 @@ def main():
         cms_chunk_sizes=[1, 64],
         cms_variant="nested",
         cms_hidden_mult=[r, r],
-        cms_mem_dim=256,       # Smaller for 0.5B model
+        cms_mem_dim=512 if src_config.hidden_size >= 2048 else 256,
         cms_mem_depth=2,
         cms_poly_degree=2,
         use_neural_memory=False,
@@ -277,12 +283,16 @@ def main():
     # ── Optimizer (AdamW, not M3 — simpler for scaffold training) ──
     optimizer = AdamW(trainable_params, lr=args.lr, weight_decay=0.01)
 
-    # Manual LR scheduling (simpler, no off-by-one issues)
+    # LR schedule: warmup → hold → gentle decay to 10% (not zero)
+    # Cosine to zero killed learning in the second half of training.
+    # We want the scaffold to keep learning throughout.
     def get_lr(step):
         if step < args.warmup:
             return args.lr * step / max(args.warmup, 1)
         progress = (step - args.warmup) / max(args.steps - args.warmup, 1)
-        return args.lr * 0.5 * (1.0 + math.cos(math.pi * progress))
+        # Cosine decay to 10% of peak LR, not zero
+        min_lr = args.lr * 0.1
+        return min_lr + (args.lr - min_lr) * 0.5 * (1.0 + math.cos(math.pi * progress))
 
     def set_lr(optimizer, lr):
         for pg in optimizer.param_groups:
