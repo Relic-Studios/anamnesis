@@ -740,16 +740,14 @@ class DeepMemoryLevel(nn.Module):
             self.conv_k = self.conv_q = self.conv_v = None
 
         # ── Data-dependent gates (Titans Eq 13-14) ──
+        # Paper-only: lr, momentum, decay. No output gate (let decay handle it).
         self.to_lr = nn.Linear(dim, 1, bias=True)          # θ_t
         self.to_momentum = nn.Linear(dim, 1, bias=True)    # η_t
         self.to_decay = nn.Linear(dim, 1, bias=True)       # α_t
-        self.to_output_gate = nn.Linear(dim, 1, bias=True)
 
-        # Gate biases
         nn.init.constant_(self.to_lr.bias, -2.0)
         nn.init.constant_(self.to_momentum.bias, 0.0)
         nn.init.constant_(self.to_decay.bias, -3.0)
-        nn.init.constant_(self.to_output_gate.bias, 0.0)
 
         # ── [ATLAS] Per-token learnable decay for Omega Rule ──
         # γ_i^(t) ∈ [0,1]: selective context inclusion/exclusion within chunk
@@ -774,18 +772,14 @@ class DeepMemoryLevel(nn.Module):
         # Runtime state (not nn.Parameters — updated during forward pass)
         self._momentum_state: dict[str, Tensor] = {}
         self._total_updates: int = 0
+        self._surprise_ema: float = 1.0
 
-        # Soul checkpoint
-        self._soul_weights: dict[str, Tensor] = {}
-        self.soul_pull_strength: float = 0.01
-        self.max_drift: float = 0.5
-
-        # Persona probe (set externally)
-        self._persona_probe: Tensor | None = None
+        # Per-position learning weight (e.g., persona mask: 1.0 for assistant, 0.1 for user)
         self._learning_weight: Tensor | None = None
 
-        # Surprise tracking (for monitoring, not gating)
-        self._surprise_ema: float = 1.0
+        # Soul/persona stubs — disabled by default, add back after baseline works
+        self._soul_weights: dict[str, Tensor] = {}
+        self._persona_probe: Tensor | None = None
 
         # ── [Memory Caching] Checkpoint cache for growing memory ──
         # Caches snapshots of memory MLP weights at intervals.
@@ -986,14 +980,11 @@ class DeepMemoryLevel(nn.Module):
         k_poly = self._poly_expand(k)
         q_poly = self._poly_expand(q)
 
-        # ── Gates ──
-        output_gate = torch.sigmoid(self.to_output_gate(x))
-
         if not self.learning_enabled or seq_len < 2:
             params = self._get_memory_params()
             retrieved = self._retrieve(q_poly, params)
             delta = self.out_proj(retrieved)
-            return base + delta * output_gate
+            return base + delta
 
         # Data-dependent gates for memory update
         lr_raw = torch.sigmoid(self.to_lr(x))
@@ -1062,10 +1053,6 @@ class DeepMemoryLevel(nn.Module):
                 self._momentum_state[name] = s
                 params[name] = (1.0 - avg_decay) * p + s
 
-            # Soul pull-back
-            if self._soul_weights:
-                params = self._soul_pullback(params)
-
             # [Memory Caching] Checkpoint memory state periodically
             self._total_updates += chunk_len
             self._cache_memory_state(params)
@@ -1079,7 +1066,7 @@ class DeepMemoryLevel(nn.Module):
 
         # Combine retrievals
         retrieved = torch.cat(all_retrievals, dim=1)
-        delta = self.out_proj(retrieved) * output_gate
+        delta = self.out_proj(retrieved)
         out = base + delta
 
         if self.drift_enabled and not self.training:
