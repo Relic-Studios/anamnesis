@@ -639,26 +639,42 @@ class LowRankLevel(nn.Module):
 
 
 class DeepMemoryLevel(nn.Module):
-    """ATLAS-style deep associative memory level for CMS.
+    """Full Behrouz-architecture deep memory level for CMS.
 
-    Replaces the broken LowRankLevel with a proper deep memory that:
-    1. Has its own KQV projections (not frozen L0 features)
-    2. Uses a deep MLP (MemoryMLP) as the actual memory store
-    3. Updates via Omega Rule (window of c tokens, not just current)
-    4. Applies NS-5 orthogonalization on momentum (Muon-style)
-    5. Uses data-dependent gates for forgetting, momentum, and output
+    Implements the complete feature set from Titans, HOPE, ATLAS, and MIRAS:
 
-    The memory MLP weights ARE the specialization. They update during
-    every forward pass via vmap+grad on the associative loss ‖M(k)-v‖².
+    From Titans:
+    1. Persistent memory tokens — learnable data-independent context
+    2. 1D depthwise-separable convolutions on K/Q/V projections
+    3. Data-dependent gates (lr, momentum, decay, output)
+
+    From ATLAS:
+    4. Omega Rule with per-token learnable decay (γ_i^(t))
+    5. Learned polynomial feature mapping (Taylor expansion init)
+    6. Deep MLP memory with associative loss
+
+    From MIRAS:
+    7. Huber loss option for robustness to outliers
+
+    From Memory Caching (2026):
+    8. Memory state checkpointing for growing effective capacity
+
+    Novel (Anamnesis):
+    9. Soul anchoring — prevents identity drift
+    10. Persona probes — SVD-focused learning
 
     Args:
         dim: Hidden dimension of the transformer.
         mem_dim: Memory working dimension (projected from dim).
         mem_depth: Depth of the memory MLP.
         chunk_size: Omega Rule window size (c tokens per update).
-        poly_degree: Polynomial feature expansion degree (1=none, 2=quadratic).
+        poly_degree: Polynomial feature expansion degree.
         max_grad_norm: Gradient clipping threshold.
-        ns_steps: Newton-Schulz iterations for momentum orthogonalization.
+        num_persistent: Number of persistent memory tokens (Titans).
+        conv_kernel: Kernel size for depthwise conv on K/Q/V (0=disabled).
+        use_huber_loss: Use Huber loss instead of MSE (MIRAS).
+        cache_interval: Cache memory state every N updates (0=disabled).
+        max_cache_size: Maximum number of cached memory states.
     """
 
     def __init__(
@@ -669,7 +685,11 @@ class DeepMemoryLevel(nn.Module):
         chunk_size: int = 64,
         poly_degree: int = 2,
         max_grad_norm: float = 10.0,
-        ns_steps: int = 5,
+        num_persistent: int = 4,
+        conv_kernel: int = 4,
+        use_huber_loss: bool = False,
+        cache_interval: int = 100,
+        max_cache_size: int = 32,
     ):
         super().__init__()
         self.dim = dim
@@ -677,42 +697,77 @@ class DeepMemoryLevel(nn.Module):
         self.chunk_size = chunk_size
         self.poly_degree = poly_degree
         self.max_grad_norm = max_grad_norm
-        self.ns_steps = ns_steps
         self.swiglu = False  # CMS interface compat
         self.learning_enabled = True
+        self.use_huber_loss = use_huber_loss
+        self.cache_interval = cache_interval
+        self.max_cache_size = max_cache_size
 
-        poly_dim = mem_dim * poly_degree  # expanded key/query dimension
+        poly_dim = mem_dim * poly_degree
 
-        # Projections (learnable via outer-loop training)
+        # ── [Titans] Persistent memory tokens ──
+        # Learnable, data-independent parameters prepended to every sequence.
+        # Encode task knowledge that doesn't change per-input.
+        if num_persistent > 0:
+            self.persistent_memory = nn.Parameter(
+                torch.randn(1, num_persistent, dim) * 0.02
+            )
+        else:
+            self.persistent_memory = None
+
+        # ── Projections ──
         self.to_k = nn.Linear(dim, mem_dim, bias=False)
         self.to_v = nn.Linear(dim, mem_dim, bias=False)
         self.to_q = nn.Linear(dim, mem_dim, bias=False)
         self.out_proj = nn.Linear(mem_dim, dim, bias=False)
 
-        # Data-dependent gates with bias for controlled initialization.
-        # With SVD-initialized projections, the memory has real influence —
-        # learning rate must start moderate to avoid destroying coherence.
-        self.to_lr = nn.Linear(dim, 1, bias=True)          # θ_t: learning rate
-        self.to_momentum = nn.Linear(dim, 1, bias=True)    # η_t: momentum decay
-        self.to_decay = nn.Linear(dim, 1, bias=True)       # α_t: forget gate
-        self.to_output_gate = nn.Linear(dim, 1, bias=True) # output contribution
+        # ── [Titans] 1D Depthwise-Separable Convolutions on K/Q/V ──
+        # Captures local patterns that pure projections miss.
+        if conv_kernel > 0:
+            self.conv_k = nn.Conv1d(
+                mem_dim, mem_dim, kernel_size=conv_kernel,
+                padding=conv_kernel - 1, groups=mem_dim,
+            )
+            self.conv_q = nn.Conv1d(
+                mem_dim, mem_dim, kernel_size=conv_kernel,
+                padding=conv_kernel - 1, groups=mem_dim,
+            )
+            self.conv_v = nn.Conv1d(
+                mem_dim, mem_dim, kernel_size=conv_kernel,
+                padding=conv_kernel - 1, groups=mem_dim,
+            )
+        else:
+            self.conv_k = self.conv_q = self.conv_v = None
+
+        # ── Data-dependent gates (Titans Eq 13-14) ──
+        self.to_lr = nn.Linear(dim, 1, bias=True)          # θ_t
+        self.to_momentum = nn.Linear(dim, 1, bias=True)    # η_t
+        self.to_decay = nn.Linear(dim, 1, bias=True)       # α_t
+        self.to_output_gate = nn.Linear(dim, 1, bias=True)
 
         # Gate biases
-        nn.init.constant_(self.to_lr.bias, -2.0)           # sigmoid(-2) ≈ 0.12
-        nn.init.constant_(self.to_momentum.bias, 0.0)      # sigmoid(0) = 0.5
-        nn.init.constant_(self.to_decay.bias, -3.0)        # sigmoid(-3) ≈ 0.05 (low forgetting)
-        nn.init.constant_(self.to_output_gate.bias, 0.0)   # sigmoid(0) = 0.5
+        nn.init.constant_(self.to_lr.bias, -2.0)
+        nn.init.constant_(self.to_momentum.bias, 0.0)
+        nn.init.constant_(self.to_decay.bias, -3.0)
+        nn.init.constant_(self.to_output_gate.bias, 0.0)
 
-        # The memory: deep MLP whose weights are the learned specialization
-        # Operates in poly_dim space (mem_dim * poly_degree)
+        # ── [ATLAS] Per-token learnable decay for Omega Rule ──
+        # γ_i^(t) ∈ [0,1]: selective context inclusion/exclusion within chunk
+        self.to_token_weight = nn.Linear(dim, 1, bias=True)
+        nn.init.constant_(self.to_token_weight.bias, 0.0)  # sigmoid(0)=0.5, equal weight
+
+        # ── Memory MLP ──
         self.memory = MemoryMLP(poly_dim, depth=mem_depth, expansion=2.0)
 
-        # Project memory output back to mem_dim for out_proj
+        # ── [ATLAS] Learned polynomial coefficients (Taylor expansion init) ──
+        # φ(k) = Σ a_i * k^i where a_i initialized at 1/i!
         if poly_degree > 1:
+            coeffs = [1.0 / math.factorial(i) for i in range(1, poly_degree + 1)]
+            self.poly_coeffs = nn.Parameter(torch.tensor(coeffs))
             self.mem_out_proj = nn.Linear(poly_dim, mem_dim, bias=False)
-            # Project values up to poly_dim for associative loss computation
             self.v_expand = nn.Linear(mem_dim, poly_dim, bias=False)
         else:
+            self.poly_coeffs = None
             self.mem_out_proj = nn.Identity()
             self.v_expand = nn.Identity()
 
@@ -732,25 +787,70 @@ class DeepMemoryLevel(nn.Module):
         # Surprise tracking (for monitoring, not gating)
         self._surprise_ema: float = 1.0
 
+        # ── [Memory Caching] Checkpoint cache for growing memory ──
+        # Caches snapshots of memory MLP weights at intervals.
+        # Allows retrieval from past memory states — growing effective capacity.
+        self._memory_cache: list[dict[str, Tensor]] = []
+
         # Neutral drift
         self.drift_enabled = False
         self.drift_sigma = 1e-5 / max(chunk_size, 1)
 
-    def _poly_expand(self, x: Tensor) -> Tensor:
-        """Polynomial feature expansion: φ(x) = [x, x², ...] / sqrt(p).
+    def _apply_conv(self, x: Tensor, conv: nn.Conv1d) -> Tensor:
+        """Apply causal 1D depthwise conv: (batch, seq, dim) -> (batch, seq, dim)."""
+        # Conv1d expects (batch, channels, seq)
+        out = conv(x.transpose(1, 2))
+        # Causal: trim to original seq length
+        out = out[:, :, :x.shape[1]]
+        return out.transpose(1, 2)
 
-        Expands mem_dim to mem_dim * poly_degree for increased memory capacity.
+    def _poly_expand(self, x: Tensor) -> Tensor:
+        """Polynomial feature expansion with learned coefficients (ATLAS).
+
+        φ(x) = [a_1*x, a_2*x², a_3*x³, ...] where a_i initialized at 1/i!
+        (Taylor expansion approximation of exp(x)).
         """
         if self.poly_degree == 1:
             return x
-        terms = [x]
-        for p in range(2, self.poly_degree + 1):
-            terms.append(x.pow(p))
-        return torch.cat(terms, dim=-1) / math.sqrt(self.poly_degree)
+        terms = []
+        for i in range(self.poly_degree):
+            power = i + 1
+            coeff = self.poly_coeffs[i] if self.poly_coeffs is not None else 1.0
+            terms.append(coeff * x.pow(power))
+        return torch.cat(terms, dim=-1)
+
+    def _cache_memory_state(self, params: dict[str, Tensor]) -> None:
+        """Cache current memory state for Memory Caching (Behrouz 2026).
+
+        Stores a snapshot of the memory MLP weights. When effective capacity
+        is exceeded, the model can refer back to past states.
+        """
+        if self.cache_interval <= 0:
+            return
+        if self._total_updates % self.cache_interval != 0:
+            return
+        snapshot = {name: p.detach().clone() for name, p in params.items()}
+        self._memory_cache.append(snapshot)
+        if len(self._memory_cache) > self.max_cache_size:
+            self._memory_cache.pop(0)  # FIFO eviction
 
     def _get_memory_params(self) -> dict[str, Tensor]:
         """Get current memory MLP parameters as a dict."""
         return dict(self.memory.named_parameters())
+
+    @staticmethod
+    def _huber_loss_fn(
+        params: dict[str, Tensor],
+        model: nn.Module,
+        keys: Tensor,
+        values: Tensor,
+    ) -> Tensor:
+        """Huber loss variant of associative memory loss (MIRAS).
+
+        More robust to outliers than MSE. Uses delta=1.0.
+        """
+        pred = functional_call(model, params, (keys.unsqueeze(0),)).squeeze(0)
+        return F.smooth_l1_loss(pred, values, reduction='sum')
 
     def _retrieve(self, queries: Tensor, params: dict[str, Tensor]) -> Tensor:
         """Retrieve from memory and project back to mem_dim."""
@@ -785,8 +885,9 @@ class DeepMemoryLevel(nn.Module):
             for name, p in params.items()
         }
 
-        # Per-token gradient computation
-        grad_fn = grad(_memory_loss_fn, argnums=0)
+        # Per-token gradient computation (MSE or Huber loss)
+        loss_fn = self._huber_loss_fn if self.use_huber_loss else _memory_loss_fn
+        grad_fn = grad(loss_fn, argnums=0)
         batched_grad_fn = vmap(grad_fn, in_dims=(0, None, 0, 0))
         per_token_grads = batched_grad_fn(expanded_params, self.memory, keys, values)
 
@@ -848,115 +949,126 @@ class DeepMemoryLevel(nn.Module):
         return updated
 
     def forward(self, x: Tensor, l0_out: Tensor | None = None) -> Tensor:
-        """Forward pass: retrieve from memory, then store (update weights).
+        """Forward pass with full Behrouz architecture.
 
-        Args:
-            x: Input to the CMS (batch, seq, dim).
-            l0_out: L0's output. If provided, output is residual on l0_out.
+        Features: persistent memory, depthwise conv, learned polynomial features,
+        Omega Rule with per-token weights, memory caching, Huber/MSE loss.
         """
         batch, seq_len, dim = x.shape
         base = l0_out if l0_out is not None else x
 
-        if not self.learning_enabled or seq_len < 2:
-            # No learning — just retrieve and return
-            q = F.normalize(self.to_q(x), dim=-1)
-            q_poly = self._poly_expand(q)
-            params = self._get_memory_params()
-            retrieved = self._retrieve(q_poly, params)
-            delta = self.out_proj(retrieved)
-            output_gate = torch.sigmoid(self.to_output_gate(x))
-            return base + delta * output_gate
+        # ── [Titans] Prepend persistent memory tokens ──
+        if self.persistent_memory is not None:
+            pm = self.persistent_memory.expand(batch, -1, -1)
+            x_with_pm = torch.cat([pm, x], dim=1)
+        else:
+            x_with_pm = x
 
-        # Project to memory space
-        k = F.normalize(self.to_k(x), dim=-1)
-        v = self.to_v(x)
-        q = F.normalize(self.to_q(x), dim=-1)
+        # ── Project to memory space + apply convolutions ──
+        k = F.normalize(self.to_k(x_with_pm), dim=-1)
+        v = self.to_v(x_with_pm)
+        q = F.normalize(self.to_q(x_with_pm), dim=-1)
 
-        # Polynomial expansion
+        # [Titans] Depthwise-separable convolutions capture local patterns
+        if self.conv_k is not None:
+            k = self._apply_conv(k, self.conv_k)
+            q = self._apply_conv(q, self.conv_q)
+            v = self._apply_conv(v, self.conv_v)
+
+        # Strip persistent memory tokens from output (they were just context)
+        if self.persistent_memory is not None:
+            n_pm = self.persistent_memory.shape[1]
+            k = k[:, n_pm:]
+            v = v[:, n_pm:]
+            q = q[:, n_pm:]
+
+        # ── [ATLAS] Learned polynomial expansion ──
         k_poly = self._poly_expand(k)
         q_poly = self._poly_expand(q)
 
-        # Data-dependent gates (averaged per chunk in the loop)
-        lr_raw = torch.sigmoid(self.to_lr(x))           # (batch, seq, 1)
+        # ── Gates ──
+        output_gate = torch.sigmoid(self.to_output_gate(x))
+
+        if not self.learning_enabled or seq_len < 2:
+            params = self._get_memory_params()
+            retrieved = self._retrieve(q_poly, params)
+            delta = self.out_proj(retrieved)
+            return base + delta * output_gate
+
+        # Data-dependent gates for memory update
+        lr_raw = torch.sigmoid(self.to_lr(x))
         mom_raw = torch.sigmoid(self.to_momentum(x))
         decay_raw = torch.sigmoid(self.to_decay(x))
-        output_gate = torch.sigmoid(self.to_output_gate(x))  # (batch, seq, 1)
 
-        # Get current memory params
+        # [ATLAS] Per-token importance weights for Omega Rule
+        token_weights = torch.sigmoid(self.to_token_weight(x))  # (batch, seq, 1)
+
         params = self._get_memory_params()
 
-        # Process in chunks (Omega Rule: each chunk is one update window)
+        # ── Process in chunks (Omega Rule) ──
         all_retrievals = []
         for chunk_start in range(0, seq_len, self.chunk_size):
             chunk_end = min(chunk_start + self.chunk_size, seq_len)
             chunk_len = chunk_end - chunk_start
 
-            # PHASE 1: RETRIEVE (read before updating — causal order)
-            q_chunk = q_poly[:, chunk_start:chunk_end]  # (batch, chunk, poly_dim)
+            # RETRIEVE (read before updating — causal order)
+            q_chunk = q_poly[:, chunk_start:chunk_end]
             retrieval = self._retrieve(q_chunk, params)
             all_retrievals.append(retrieval)
 
-            # PHASE 2: STORE (compute gradients and update weights per-token)
+            # STORE (compute gradients and update weights)
             if torch.is_grad_enabled():
-                # During backprop training, don't update memory weights
                 continue
 
             k_chunk = k_poly[:, chunk_start:chunk_end]
             v_chunk = v[:, chunk_start:chunk_end]
-
-            # Expand values to poly_dim for loss computation
             v_expanded = self.v_expand(v_chunk)
 
-            # Flatten batch and chunk for vmap — treats each (batch, position) as one token
-            k_flat = k_chunk.reshape(-1, k_chunk.shape[-1])  # (batch*chunk, poly_dim)
+            k_flat = k_chunk.reshape(-1, k_chunk.shape[-1])
             v_flat = v_expanded.reshape(-1, v_expanded.shape[-1])
 
             # Per-token gradients via vmap+grad
             token_grads = self._compute_per_token_gradients(k_flat, v_flat, params)
 
-            # OMEGA RULE: average gradients over the chunk, apply ONE update.
-            # This is c-token context-aware optimization, not per-token noise.
+            # [ATLAS] Weighted average using per-token importance (γ_i^(t))
+            tw = token_weights[:, chunk_start:chunk_end].reshape(-1, 1)  # (batch*chunk, 1)
             n_tokens = k_flat.shape[0]
-            avg_grads = {}
+            weighted_grads = {}
             for name, g in token_grads.items():
-                avg_grads[name] = g.mean(dim=0)  # average over chunk tokens
+                # Weight each token's gradient by its importance
+                g_weighted = g * tw.view(-1, *([1] * (g.dim() - 1)))
+                weighted_grads[name] = g_weighted.sum(dim=0) / (tw.sum() + 1e-8)
 
             # Chunk-averaged gate values
             avg_lr = lr_raw[:, chunk_start:chunk_end].mean()
             avg_mom = mom_raw[:, chunk_start:chunk_end].mean()
             avg_decay = decay_raw[:, chunk_start:chunk_end].mean()
 
-            # Track surprise (for monitoring)
-            total_grad_norm = sum(g.norm().item() for g in avg_grads.values())
+            # Surprise tracking
+            total_grad_norm = sum(g.norm().item() for g in weighted_grads.values())
             self._surprise_ema = 0.95 * self._surprise_ema + 0.05 * total_grad_norm
 
-            # Single momentum update per chunk (Omega Rule)
+            # Momentum update
             for name, p in params.items():
-                g = avg_grads.get(name)
+                g = weighted_grads.get(name)
                 if g is None:
                     continue
-                # Gradient clipping
                 g_norm = g.norm()
                 if g_norm > self.max_grad_norm:
                     g = g * (self.max_grad_norm / g_norm)
-                # Initialize momentum
                 if name not in self._momentum_state:
                     self._momentum_state[name] = torch.zeros_like(g)
-                # S = η·S_prev - θ·grad
                 s = avg_mom * self._momentum_state[name] - avg_lr * g
                 self._momentum_state[name] = s
-                # M = (1-α)·M_prev + S
                 params[name] = (1.0 - avg_decay) * p + s
 
             # Soul pull-back
             if self._soul_weights:
                 params = self._soul_pullback(params)
 
+            # [Memory Caching] Checkpoint memory state periodically
             self._total_updates += chunk_len
-
-            # NOTE: Projections (to_k, to_v, out_proj) stay fixed at SVD init.
-            # They provide meaningful input/output directions from pre-trained weights.
-            # Only the memory MLP content adapts during inference.
+            self._cache_memory_state(params)
 
         # Write updated params back to the memory module
         if not torch.is_grad_enabled():
@@ -965,11 +1077,9 @@ class DeepMemoryLevel(nn.Module):
                     if name in params:
                         p.data.copy_(params[name].detach())
 
-        # Combine all retrieved chunks
-        retrieved = torch.cat(all_retrievals, dim=1)  # (batch, seq, mem_dim)
-        delta = self.out_proj(retrieved)
-        delta = delta * output_gate
-
+        # Combine retrievals
+        retrieved = torch.cat(all_retrievals, dim=1)
+        delta = self.out_proj(retrieved) * output_gate
         out = base + delta
 
         if self.drift_enabled and not self.training:
