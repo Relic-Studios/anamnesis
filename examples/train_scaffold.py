@@ -71,19 +71,18 @@ def get_trainable_params(model):
 
 def get_data_iterator(tokenizer, seq_len=512, batch_size=4):
     """Stream data from FineWeb-Edu for training."""
+    from datasets import load_dataset
+    # Use Wikipedia — clean factual text with zero AI identity contamination.
+    # FineWeb-Edu contains web conversations that leak "I'm Claude" etc.
+    # The scaffold should learn HOW to memorize, not WHAT identity to have.
     try:
-        from datasets import load_dataset
-        dataset = load_dataset(
-            "HuggingFaceFW/fineweb-edu",
-            name="sample-10BT",
-            split="train",
-            streaming=True,
-        )
+        dataset = load_dataset("wikimedia/wikipedia", "20231101.en",
+                               split="train", streaming=True)
     except Exception as e:
-        print(f"Could not load FineWeb-Edu: {e}")
-        print("Falling back to wikitext...")
-        from datasets import load_dataset
-        dataset = load_dataset("wikitext", "wikitext-103-raw-v1", split="train", streaming=True)
+        print(f"Could not load Wikipedia: {e}")
+        print("Falling back to wikitext-103...")
+        dataset = load_dataset("wikitext", "wikitext-103-raw-v1",
+                               split="train", streaming=True)
 
     buffer = []
     buffer_tokens = 0
