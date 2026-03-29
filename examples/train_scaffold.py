@@ -411,9 +411,16 @@ def main():
             ckpt = {
                 "model_state": {
                     k: v.cpu() for k, v in model.state_dict().items()
-                    if any(dm_key in k for dm_key in ['to_k', 'to_v', 'to_q', 'out_proj',
-                           'to_lr', 'to_momentum', 'to_decay', 'to_output_gate',
-                           'memory', 'mem_out_proj', 'v_expand'])
+                    if any(dm_key in k for dm_key in [
+                        'to_k', 'to_v', 'to_q', 'out_proj',
+                        'to_lr', 'to_momentum', 'to_decay', 'to_output_gate',
+                        'to_token_weight',      # Omega Rule
+                        'memory',                # MemoryMLP
+                        'mem_out_proj', 'v_expand',
+                        'persistent_memory',     # Titans persistent tokens
+                        'conv_k', 'conv_q', 'conv_v',  # Depthwise convolutions
+                        'poly_coeffs',           # Learned polynomial coefficients
+                    ])
                 },
                 "step": step,
                 "loss": losses[-1],

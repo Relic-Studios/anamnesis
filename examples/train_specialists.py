@@ -156,7 +156,15 @@ def measure_ppl(model, tokenizer, conversations, device, max_len=512):
 
 
 def generate(model, tokenizer, prompt, system="", device="cuda", max_tokens=150, temperature=0.7):
-    full = f"<|im_start|>system\n{system}<|im_end|>\n<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n"
+    # Use chat format for Instruct models, completion format for base models
+    is_base = "instruct" not in (getattr(tokenizer, 'name_or_path', '') or '').lower()
+    if is_base:
+        if system:
+            full = f"{system}\n\nQuestion: {prompt}\nAnswer:"
+        else:
+            full = f"Question: {prompt}\nAnswer:"
+    else:
+        full = f"<|im_start|>system\n{system}<|im_end|>\n<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n"
     ids = tokenizer(full, return_tensors="pt", max_length=1024, truncation=True)["input_ids"].to(device)
     generated = []
     model.eval()
@@ -191,13 +199,17 @@ def evolve(model, tokenizer, conversations, device, label=""):
         layer.cms.levels[1].learning_enabled = True
 
     t0 = time.time()
+    is_base = "instruct" not in (getattr(tokenizer, 'name_or_path', '') or '').lower()
     for i, convo in enumerate(conversations):
         sys_text = convo.get("system", "")
-        text = (
-            f"<|im_start|>system\n{sys_text}<|im_end|>\n"
-            f"<|im_start|>user\n{convo['input']}<|im_end|>\n"
-            f"<|im_start|>assistant\n{convo['output']}<|im_end|>"
-        )
+        if is_base:
+            text = f"{sys_text}\n\nQuestion: {convo['input']}\nAnswer: {convo['output']}"
+        else:
+            text = (
+                f"<|im_start|>system\n{sys_text}<|im_end|>\n"
+                f"<|im_start|>user\n{convo['input']}<|im_end|>\n"
+                f"<|im_start|>assistant\n{convo['output']}<|im_end|>"
+            )
         ids = tokenizer(text, max_length=512, truncation=True,
                         return_tensors="pt")["input_ids"].to(device)
         model.set_learning_weight(persona_mask(ids))
