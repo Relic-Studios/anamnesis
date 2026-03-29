@@ -310,12 +310,13 @@ def main():
 
     # ── Setup trainable params: L0 at low LR + DeepMemoryLevels at full LR ──
     print(f"\n[2] Setting up training: L0 (low LR) + DeepMemoryLevels (full LR)...")
-    l0_params, deep_mem_params, l0_count, deep_mem_count, frozen_count = get_trainable_params(model, train_l0=True)
-    total_trainable = l0_count + deep_mem_count
-    print(f"  L0 (SwiGLU):       {l0_count:,} params ({l0_count/1e6:.1f}M) @ lr={args.lr/10:.1e}")
+    # L0 frozen for now — AdamW on 5.7B L0 params needs ~45GB optimizer state.
+    # Train only DeepMemoryLevel params. Revisit L0 with SGD or bigger GPU.
+    l0_params, deep_mem_params, l0_count, deep_mem_count, frozen_count = get_trainable_params(model, train_l0=False)
+    total_trainable = deep_mem_count
     print(f"  DeepMemoryLevels:  {deep_mem_count:,} params ({deep_mem_count/1e6:.1f}M) @ lr={args.lr:.1e}")
-    print(f"  Frozen (attention): {frozen_count:,} params ({frozen_count/1e6:.1f}M)")
-    print(f"  Total trainable:   {total_trainable/(total_trainable+frozen_count)*100:.1f}%")
+    print(f"  Frozen (L0+attn):  {(l0_count+frozen_count):,} params ({(l0_count+frozen_count)/1e6:.1f}M)")
+    print(f"  Total trainable:   {total_trainable/(total_trainable+l0_count+frozen_count)*100:.1f}%")
 
     if args.checkpoint:
         print(f"  Loading checkpoint: {args.checkpoint}")
@@ -333,10 +334,7 @@ def main():
         return
 
     # ── Optimizer (AdamW, not M3 — simpler for scaffold training) ──
-    optimizer = AdamW([
-        {"params": l0_params, "lr": args.lr / 10},       # L0: gentle adaptation
-        {"params": deep_mem_params, "lr": args.lr},        # DeepMemory: full speed
-    ], weight_decay=0.01)
+    optimizer = AdamW(deep_mem_params, lr=args.lr, weight_decay=0.01)
 
     # LR schedule: warmup → hold → gentle decay to 10% (not zero)
     # Cosine to zero killed learning in the second half of training.
@@ -383,7 +381,7 @@ def main():
         loss = output["loss"]
 
         loss.backward()
-        nn.utils.clip_grad_norm_(l0_params + deep_mem_params, max_norm=1.0)
+        nn.utils.clip_grad_norm_(deep_mem_params, max_norm=1.0)
         optimizer.step()
         optimizer.zero_grad()
 
