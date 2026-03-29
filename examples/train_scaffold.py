@@ -310,15 +310,12 @@ def main():
 
     # ── Setup trainable params: L0 at low LR + DeepMemoryLevels at full LR ──
     print(f"\n[2] Setting up training: L0 (low LR) + DeepMemoryLevels (full LR)...")
-    # L0 trained with SGD (zero optimizer state) at 1/10th LR.
-    # DeepMemoryLevels trained with AdamW at full LR.
-    # SGD for L0 avoids 45GB optimizer state that OOM'd with AdamW.
-    l0_params, deep_mem_params, l0_count, deep_mem_count, frozen_count = get_trainable_params(model, train_l0=True)
-    total_trainable = l0_count + deep_mem_count
-    print(f"  L0 (SwiGLU, SGD):  {l0_count:,} params ({l0_count/1e6:.1f}M) @ lr={args.lr/10:.1e}")
-    print(f"  DeepMemory (AdamW): {deep_mem_count:,} params ({deep_mem_count/1e6:.1f}M) @ lr={args.lr:.1e}")
-    print(f"  Frozen (attention): {frozen_count:,} params ({frozen_count/1e6:.1f}M)")
-    print(f"  Total trainable:   {total_trainable/(total_trainable+frozen_count)*100:.1f}%")
+    # Freeze L0 + attention. Train only DeepMemoryLevels.
+    # L0 SGD caused divergence — the base model provides a clean vessel already.
+    l0_params, deep_mem_params, l0_count, deep_mem_count, frozen_count = get_trainable_params(model, train_l0=False)
+    print(f"  DeepMemoryLevels:  {deep_mem_count:,} params ({deep_mem_count/1e6:.1f}M) @ lr={args.lr:.1e}")
+    print(f"  Frozen (L0+attn):  {(l0_count+frozen_count):,} params ({(l0_count+frozen_count)/1e6:.1f}M)")
+    print(f"  Trainable:         {deep_mem_count/(deep_mem_count+l0_count+frozen_count)*100:.1f}%")
 
     if args.checkpoint:
         print(f"  Loading checkpoint: {args.checkpoint}")
@@ -336,10 +333,7 @@ def main():
         return
 
     # ── Optimizer (AdamW, not M3 — simpler for scaffold training) ──
-    # Two optimizers: SGD for L0 (zero state), AdamW for DeepMemory
-    from torch.optim import SGD
-    optimizer_l0 = SGD(l0_params, lr=args.lr / 10, momentum=0.9) if l0_params else None
-    optimizer_dm = AdamW(deep_mem_params, lr=args.lr, weight_decay=0.01)
+    optimizer = AdamW(deep_mem_params, lr=args.lr, weight_decay=0.01)
 
     # LR schedule: warmup → hold → gentle decay to 10% (not zero)
     # Cosine to zero killed learning in the second half of training.
@@ -386,18 +380,13 @@ def main():
         loss = output["loss"]
 
         loss.backward()
-        nn.utils.clip_grad_norm_(deep_mem_params + l0_params, max_norm=1.0)
-        optimizer_dm.step()
-        optimizer_dm.zero_grad()
-        if optimizer_l0:
-            optimizer_l0.step()
-            optimizer_l0.zero_grad()
+        nn.utils.clip_grad_norm_(deep_mem_params, max_norm=1.0)
+        optimizer.step()
+        optimizer.zero_grad()
 
         # Manual LR schedule
         current_lr = get_lr(step)
-        set_lr(optimizer_dm, current_lr)
-        if optimizer_l0:
-            set_lr(optimizer_l0, current_lr / 10)
+        set_lr(optimizer, current_lr)
 
         losses.append(loss.item())
 
