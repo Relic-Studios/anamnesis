@@ -279,7 +279,7 @@ def main():
 
     print(f"\n[1] Loading and converting {args.model}...")
     src_model = AutoModelForCausalLM.from_pretrained(
-        args.model, torch_dtype=torch.bfloat16, device_map=args.device,
+        args.model, torch_dtype=torch.bfloat16, device_map="cuda:0",
     )
 
     r = src_config.intermediate_size / src_config.hidden_size
@@ -306,7 +306,7 @@ def main():
     model = model_to_hope(src_model, hope_config, verbose=True)
     del src_model
     torch.cuda.empty_cache()
-    model = model.to(args.device, dtype=torch.bfloat16)
+    model = model.to("cuda:0", dtype=torch.bfloat16)
 
     # ── Setup trainable params: L0 at low LR + DeepMemoryLevels at full LR ──
     print(f"\n[2] Setting up training: L0 (low LR) + DeepMemoryLevels (full LR)...")
