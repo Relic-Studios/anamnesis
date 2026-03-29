@@ -242,7 +242,7 @@ def main():
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--seq-len", type=int, default=512)
     parser.add_argument("--lr", type=float, default=3e-4)
-    parser.add_argument("--warmup", type=int, default=200)
+    parser.add_argument("--warmup", type=int, default=5000)
     parser.add_argument("--log-every", type=int, default=50)
     parser.add_argument("--save-every", type=int, default=1000)
     parser.add_argument("--eval-every", type=int, default=500)
