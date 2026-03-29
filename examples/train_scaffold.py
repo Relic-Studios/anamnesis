@@ -292,11 +292,13 @@ def main():
         max_position_embeddings=getattr(src_config, "max_position_embeddings", 32768),
         rope_theta=getattr(src_config, "rope_theta", 1_000_000.0),
         rms_norm_eps=getattr(src_config, "rms_norm_eps", 1e-6),
-        cms_levels=2,
-        cms_chunk_sizes=[1, 64],
+        cms_levels=5,
+        cms_chunk_sizes=[1, 1, 32, 256, 2048],
         cms_variant="nested",
-        cms_hidden_mult=[r, r],
-        cms_mem_dim=512 if src_config.hidden_size >= 2048 else 256,
+        cms_hidden_mult=[r, r, r, r, r],
+        # mem_dim=128 so 4 DeepMemoryLevels fit in A100 80GB with vmap
+        # (512 × 4 levels OOMed — vmap expands params × all tokens)
+        cms_mem_dim=128,
         cms_mem_depth=2,
         cms_poly_degree=2,
         use_neural_memory=False,
