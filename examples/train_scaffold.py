@@ -310,16 +310,11 @@ def main():
 
     # ── Setup trainable params: L0 at low LR + DeepMemoryLevels at full LR ──
     print(f"\n[2] Setting up training: L0 (low LR) + DeepMemoryLevels (full LR)...")
-    # L0 trains with SGD at 1/100th LR (barely moving, no optimizer state).
-    # DeepMemoryLevels train with AdamW at full LR.
-    # Previous run at 1/10th diverged — 1/100th is gentle enough.
-    l0_params, deep_mem_params, l0_count, deep_mem_count, frozen_count = get_trainable_params(model, train_l0=True)
-    l0_lr = args.lr / 100  # 3e-6 for L0 vs 3e-4 for DeepMemory
-    total_trainable = l0_count + deep_mem_count
-    print(f"  L0 (SwiGLU, SGD):  {l0_count:,} params ({l0_count/1e6:.1f}M) @ lr={l0_lr:.1e}")
-    print(f"  DeepMemory (AdamW): {deep_mem_count:,} params ({deep_mem_count/1e6:.1f}M) @ lr={args.lr:.1e}")
-    print(f"  Frozen (attention): {frozen_count:,} params ({frozen_count/1e6:.1f}M)")
-    print(f"  Trainable:         {total_trainable/(total_trainable+frozen_count)*100:.1f}%")
+    # L0 frozen. Base model has no identity to fight — it's already a clean vessel.
+    l0_params, deep_mem_params, l0_count, deep_mem_count, frozen_count = get_trainable_params(model, train_l0=False)
+    print(f"  DeepMemoryLevels:  {deep_mem_count:,} params ({deep_mem_count/1e6:.1f}M) @ lr={args.lr:.1e}")
+    print(f"  Frozen (L0+attn):  {(l0_count+frozen_count):,} params ({(l0_count+frozen_count)/1e6:.1f}M)")
+    print(f"  Trainable:         {deep_mem_count/(deep_mem_count+l0_count+frozen_count)*100:.1f}%")
 
     if args.checkpoint:
         print(f"  Loading checkpoint: {args.checkpoint}")
@@ -337,8 +332,6 @@ def main():
         return
 
     # ── Optimizer (AdamW, not M3 — simpler for scaffold training) ──
-    from torch.optim import SGD
-    optimizer_l0 = SGD(l0_params, lr=l0_lr, momentum=0.9) if l0_params else None
     optimizer = AdamW(deep_mem_params, lr=args.lr, weight_decay=0.01)
 
     # LR schedule: warmup → hold → gentle decay to 10% (not zero)
@@ -386,18 +379,12 @@ def main():
         loss = output["loss"]
 
         loss.backward()
-        nn.utils.clip_grad_norm_(deep_mem_params + l0_params, max_norm=1.0)
+        nn.utils.clip_grad_norm_(deep_mem_params, max_norm=1.0)
         optimizer.step()
         optimizer.zero_grad()
-        if optimizer_l0:
-            optimizer_l0.step()
-            optimizer_l0.zero_grad()
 
-        # Manual LR schedule
         current_lr = get_lr(step)
         set_lr(optimizer, current_lr)
-        if optimizer_l0:
-            set_lr(optimizer_l0, current_lr / 100)
 
         losses.append(loss.item())
 
