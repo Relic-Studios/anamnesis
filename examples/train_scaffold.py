@@ -153,12 +153,13 @@ def get_data_iterator(tokenizer, seq_len=512, batch_size=4, vessel_data_dir=None
             yield torch.tensor(batch_ids)
 
 
-def evaluate(model, tokenizer, device, n_batches=20, seq_len=512):
-    """Quick perplexity evaluation."""
+def evaluate(model, tokenizer, device, n_batches=20, seq_len=512, vessel_data_dir=None):
+    """Quick perplexity evaluation on vessel data."""
     model.eval()
     total_loss = 0.0
     total_tokens = 0
-    data_iter = get_data_iterator(tokenizer, seq_len=seq_len, batch_size=2)
+    data_iter = get_data_iterator(tokenizer, seq_len=seq_len, batch_size=2,
+                                  vessel_data_dir=vessel_data_dir)
 
     with torch.no_grad():
         for i, batch in enumerate(data_iter):
@@ -322,7 +323,10 @@ def main():
         model.load_state_dict(state["model_state"], strict=False)
 
     if args.eval_only:
-        ppl = evaluate(model, tokenizer, args.device)
+        anima_dir = Path("C:/Dev/anima/data/training")
+        local_dir = Path(__file__).parent.parent / "data" / "scaffold_training"
+        vessel_dir = str(anima_dir if anima_dir.exists() else local_dir)
+        ppl = evaluate(model, tokenizer, args.device, vessel_data_dir=vessel_dir)
         print(f"\n  Eval PPL: {ppl:.2f}")
         if args.test_inner_loop:
             test_inner_loop(model, tokenizer, args.device)
@@ -349,9 +353,14 @@ def main():
         for pg in optimizer.param_groups:
             pg['lr'] = lr
 
+    # ── Vessel data path ──
+    anima_dir = Path("C:/Dev/anima/data/training")
+    local_dir = Path(__file__).parent.parent / "data" / "scaffold_training"
+    vessel_dir = str(anima_dir if anima_dir.exists() else local_dir)
+
     # ── Baseline eval ──
     print(f"\n[3] Baseline evaluation...")
-    baseline_ppl = evaluate(model, tokenizer, args.device)
+    baseline_ppl = evaluate(model, tokenizer, args.device, vessel_data_dir=vessel_dir)
     print(f"  Baseline PPL: {baseline_ppl:.2f}")
 
     # ── Training loop ──
@@ -360,11 +369,6 @@ def main():
     # Disable inner-loop learning during outer-loop training
     for layer in model.layers:
         layer.cms.enable_learning(False)
-
-    # Try anima corpus first, fall back to local scaffold data
-    anima_dir = Path("C:/Dev/anima/data/training")
-    local_dir = Path(__file__).parent.parent / "data" / "scaffold_training"
-    vessel_dir = str(anima_dir if anima_dir.exists() else local_dir)
     data_iter = get_data_iterator(tokenizer, seq_len=args.seq_len, batch_size=args.batch_size,
                                   vessel_data_dir=vessel_dir)
     t0 = time.time()
@@ -402,7 +406,7 @@ def main():
             )
 
         if step % args.eval_every == 0:
-            eval_ppl = evaluate(model, tokenizer, args.device)
+            eval_ppl = evaluate(model, tokenizer, args.device, vessel_data_dir=vessel_dir)
             print(f"  [Eval] Step {step} PPL: {eval_ppl:.2f} (baseline: {baseline_ppl:.2f})")
             model.train()
             for layer in model.layers:
@@ -427,7 +431,7 @@ def main():
     # ── Final eval ──
     elapsed = time.time() - t0
     print(f"\n[5] Training complete ({elapsed/60:.1f} minutes)")
-    final_ppl = evaluate(model, tokenizer, args.device)
+    final_ppl = evaluate(model, tokenizer, args.device, vessel_data_dir=vessel_dir)
     print(f"  Baseline PPL: {baseline_ppl:.2f}")
     print(f"  Final PPL:    {final_ppl:.2f}")
     print(f"  Delta:        {final_ppl - baseline_ppl:+.2f}")
