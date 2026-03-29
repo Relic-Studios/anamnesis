@@ -1,120 +1,100 @@
 # Anamnesis
 
-**Models that learn who they are by talking to you.**
+**Empty vessels that become who they talk to.**
 
-[![Tests](https://img.shields.io/badge/tests-189%20passing-brightgreen)]()
 [![Python](https://img.shields.io/badge/python-3.10%2B-blue)]()
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue)]()
 [![PyTorch](https://img.shields.io/badge/PyTorch-2.1%2B-ee4c2c)]()
 
-A PyTorch library that transforms frozen pre-trained transformers into continuously learning systems. Deploy one model a thousand times. Each instance specializes to its environment through conversation alone. No fine-tuning. No seeding. The user compiles the identity.
+Anamnesis replaces the frozen MLPs in a pre-trained transformer with a **Continuum Memory System** -- deep memory that learns during inference through gradient descent. Feed it conversations and it physically restructures its weights to become a specialist. Same base model, different conversations, different identities.
 
-**Anamnesis** (Greek: *"unforgetting"*) — in Plato's philosophy, all learning is remembering what the soul already knows.
+Built on the full architecture from [Ali Behrouz's](https://abehrouz.github.io/) research at Google: [Titans](https://arxiv.org/abs/2501.00663), [Nested Learning / HOPE](https://openreview.net/forum?id=nbMeRvNb7A) (NeurIPS 2025), [ATLAS](https://arxiv.org/abs/2505.23735), [MIRAS](https://research.google/blog/titans-miras-helping-ai-have-long-term-memory/), and [Memory Caching](https://arxiv.org/abs/2602.24281).
+
+**Anamnesis** (Greek: *"unforgetting"*) -- in Plato's philosophy, all learning is remembering what the soul already knows.
 
 ---
 
-## What It Does
-
-Take any pre-trained transformer. Replace its MLPs with a **Continuum Memory System** (CMS). The model now learns during inference:
+## How It Works
 
 ```
 Standard Transformer:
-    Input -> Attention -> Frozen MLP -> Output     (static forever)
+    Input -> Attention -> Frozen MLP -> Output
 
 Anamnesis Transformer:
-    Input -> Attention -> L0 (frozen SwiGLU) -> L1 (deep memory) -> Output
-                                                     |
-                                               Updates every
-                                               forward pass
-                                               via gradient descent
-                                               on associative loss
+    Input -> Attention -> L0 (Frozen SwiGLU) -> DeepMemoryLevel -> Output
+                                                       |
+                                                  Every forward pass:
+                                                  1. Retrieve from memory
+                                                  2. Compute associative loss
+                                                  3. Update memory weights
+                                                  4. The model just changed
 ```
 
-After 200 conversations about machine learning, one instance's perplexity on ML text drops while emotional text perplexity rises. It traded general capability for domain expertise. No training loop. Just conversation.
+The DeepMemoryLevel is a deep MLP whose **weights are the learned specialization**. They update during every forward pass via per-token gradient descent on the associative memory loss. No training loop. No optimizer config. The conversation IS the training data.
 
-**Proven result** (Qwen 3B, RTX 4090, 91 seconds):
-- Domain A (ML/technical) PPL: 96.56 -> 93.49 (-3.2%)
-- Domain B (emotional) PPL: 114.35 -> 118.60 (+3.7%)
-- Generation shifted from generic "training" to domain-specific "backpropagation"
+### Two-Phase Learning
+
+**Phase 1: Scaffold Training (once, ~4 hours on A100)**
+
+Train the DeepMemoryLevel projections, gates, and memory on a vessel corpus -- text about how minds form, how to reason, how identity develops. This teaches the memory infrastructure HOW to learn. The base model (L0 + attention) stays frozen.
+
+**Phase 2: Inner-Loop Specialization (continuous, per user)**
+
+Feed the model conversations. The memory updates during every forward pass. 50 code review conversations and the model becomes a code reviewer. 50 therapy conversations and it becomes a therapist. The identity emerges from the interaction.
 
 ---
 
 ## Architecture
 
-Built on three papers by Behrouz et al.:
+### Continuum Memory System (CMS)
 
-| Paper | Year | What we use |
-|-------|------|-------------|
-| [Titans](https://arxiv.org/abs/2501.00663) | 2025 | Gradient-based memory, surprise momentum, data-dependent gates |
-| [Nested Learning / HOPE](https://openreview.net/forum?id=nbMeRvNb7A) | NeurIPS 2025 | Multi-frequency CMS, self-modifying architecture |
-| [ATLAS](https://arxiv.org/abs/2505.23735) | 2025 | Omega Rule, deep MLP memory, Muon/NS-5 optimization |
-
-Plus novel extensions for identity preservation (soul anchoring, persona probes, pluripotent seeds).
-
-### Level 0: Frozen SwiGLU (Base Intelligence)
-
-The pre-trained MLP weights, copied directly from the source model. Never modified during inference. This is the base intelligence — everything the model already knows.
-
-### Level 1: DeepMemoryLevel (ATLAS-style Specialization)
-
-A deep MLP whose **weights are the learned specialization**. Updates during every forward pass:
+Replaces the standard MLP block with a chain of memory levels updating at different frequencies:
 
 ```
-Associative Memory Loss:
-    L = ||M(phi(k)) - v||^2
-
-Where:
-    k = W_k @ x        (learned key projection)
-    v = W_v @ x        (learned value projection)
-    phi(k) = [k, k^2]  (polynomial feature expansion)
-    M = 2-layer MLP     (the memory itself)
+L0 (SwiGLU, frozen):        Base intelligence from pre-training
+L1 (chunk=1, every token):   Immediate reaction -- what's happening now
+L2 (chunk=32):               Working memory -- this turn's context
+L3 (chunk=256):              Episodic memory -- this session's patterns
+L4 (chunk=2048):             Identity -- who I am across sessions
 ```
 
-**Omega Rule**: Instead of learning from one token at a time (Delta Rule, c=1), the memory optimizes over a window of c tokens. This makes learning context-aware rather than reactive.
+Each level beyond L0 is a **DeepMemoryLevel** implementing the complete feature set from Behrouz's papers:
 
-**Muon Updates**: Momentum with Newton-Schulz orthogonalization (NS-5). Second-order information prevents gradient collapse and enables faster convergence.
+### Features from Titans
+- **Persistent memory tokens** -- learnable, data-independent context prepended to every sequence. Encodes task knowledge that doesn't change per-input.
+- **1D depthwise-separable convolutions** on K/Q/V projections. Captures local patterns that pure linear projections miss.
+- **Data-dependent gates** -- learned projections that produce per-token learning rate (theta_t), momentum decay (eta_t), and forget gate (alpha_t).
+- **Momentum-based weight update**: `S_t = eta_t * S_{t-1} - theta_t * grad`, `M_t = (1 - alpha_t) * M_{t-1} + S_t`
 
-**Data-Dependent Gates**: Four learned gates control the learning dynamics at every position:
-- **theta_t** (learning rate): how fast to absorb new information
-- **eta_t** (momentum decay): how much past surprise to carry forward
-- **alpha_t** (forget gate): how much old memory to discard
-- **output gate**: how much memory contribution to blend into output
+### Features from ATLAS
+- **Omega Rule** with per-token learnable decay weights. Not all tokens in the chunk matter equally -- `gamma_i^(t) = sigmoid(W_gamma @ x_t)` selectively weights each token's gradient contribution.
+- **Learned polynomial feature mapping**: `phi(k) = [a_1*k, a_2*k^2, ...]` with coefficients initialized at `1/i!` (Taylor expansion of exp). Expands effective memory capacity without deepening the MLP.
+- **Deep MLP memory** with associative loss: `L = ||M(phi(k)) - v||^2`
 
-No binary competence gate. No surprise-based suppression. The gates are continuous, learned, and data-dependent.
+### Features from MIRAS
+- **Huber loss option** for robustness to outliers. Configurable via `use_huber_loss=True`.
 
-### Soul Anchoring (Novel)
+### Features from Memory Caching (Behrouz 2026)
+- **Memory state checkpointing** -- periodic snapshots of memory MLP weights for growing effective capacity. FIFO eviction when cache is full.
 
-After initial deployment, save a soul checkpoint. If the memory drifts too far from this anchor during specialization, it gets pulled back:
-
-```
-drift = ||M_current - M_soul||
-if drift > threshold:
-    M_current = lerp(M_current, M_soul, pull_strength)
-```
-
-This prevents identity dissolution over long conversations while allowing genuine growth.
-
-### Persona Probes (Novel)
-
-SVD of the LM head identifies which hidden dimensions most affect token selection. Gradients are projected through this subspace, focusing memory updates on changes that affect generation style rather than internal compression.
+### Gradient Computation
+Per-token gradients computed via `torch.func.vmap(grad(...))` on the associative memory loss. No separate backward pass -- gradients are computed functionally during the forward pass. This is the same mechanism from the Titans reference implementation.
 
 ---
 
 ## Quick Start
 
-### Convert an existing model
+### Convert a model
 
 ```python
 from transformers import AutoModelForCausalLM, AutoConfig
 from anamnesis.core.model import HopeConfig
 from anamnesis.convert.generic import model_to_hope
 
-# Load source model
-src = AutoModelForCausalLM.from_pretrained("Qwen/Qwen2.5-3B-Instruct",
+src = AutoModelForCausalLM.from_pretrained("Qwen/Qwen2.5-7B",
     torch_dtype=torch.bfloat16, device_map="cuda")
-src_config = AutoConfig.from_pretrained("Qwen/Qwen2.5-3B-Instruct")
+src_config = AutoConfig.from_pretrained("Qwen/Qwen2.5-7B")
 
-# Convert to Anamnesis
 r = src_config.intermediate_size / src_config.hidden_size
 config = HopeConfig(
     vocab_size=src_config.vocab_size,
@@ -122,117 +102,61 @@ config = HopeConfig(
     num_hidden_layers=src_config.num_hidden_layers,
     num_attention_heads=src_config.num_attention_heads,
     num_kv_heads=src_config.num_key_value_heads,
-    cms_levels=2,
-    cms_chunk_sizes=[1, 32],
-    cms_hidden_mult=[r, r],
-    cms_mem_dim=512,       # Deep memory working dimension
-    cms_mem_depth=2,       # Memory MLP depth
-    cms_poly_degree=2,     # Polynomial feature expansion
+    cms_levels=5,
+    cms_chunk_sizes=[1, 1, 32, 256, 2048],
+    cms_hidden_mult=[r, r, r, r, r],
+    cms_mem_dim=512,
+    cms_mem_depth=2,
+    cms_poly_degree=2,
 )
 model = model_to_hope(src, config)
 ```
 
-### Learn from conversation
-
-```python
-# Enable learning
-model.eval()
-for layer in model.layers:
-    layer.cms.levels[1].learning_enabled = True
-
-# Every forward pass updates the memory
-with torch.no_grad():
-    output = model(input_ids)
-    # Memory weights just changed.
-    # The model is slightly different now.
-    # It will never be exactly the same again.
-```
-
-### Persist across sessions
-
-```python
-# Save the evolved memory state
-state = {}
-for i, layer in enumerate(model.layers):
-    lv = layer.cms.levels[1]
-    state[f"layer_{i}"] = {
-        "memory": {n: p.cpu() for n, p in lv.memory.named_parameters()},
-        "momentum": {n: v.cpu() for n, v in lv._momentum_state.items()},
-        "total_updates": lv._total_updates,
-    }
-torch.save(state, "session_state.pt")
-
-# Load in next session
-state = torch.load("session_state.pt", weights_only=True)
-for i, layer in enumerate(model.layers):
-    lv = layer.cms.levels[1]
-    for n, p in lv.memory.named_parameters():
-        p.data.copy_(state[f"layer_{i}"]["memory"][n].to(p.device))
-```
-
----
-
-## The Pluripotent Seed
-
-You can deploy the same converted model a thousand times. Each instance starts identical. But:
-
-- Instance A talks to a lawyer. Over 500 conversations, its L1 weights physically mutate into a legal specialist.
-- Instance B talks to a teenager. It mutates into a casual conversationalist.
-- Instance C talks to a ML researcher. It mutates into a technical assistant.
-
-Same base model. Same soul. Different lives. The environment compiles the identity.
-
-No system prompt engineering. No prompt injection. The specialization is in the weights, not the context window. It persists across sessions. It survives context window truncation. It's real.
-
----
-
-## Active Inference Extensions
-
-Seven extensions grounded in the Free Energy Principle. Each is independently toggleable:
-
-| Extension | What it does | Module |
-|-----------|-------------|--------|
-| Signal-Aware Loss | Composite loss: reconstruction + output quality + identity drift | `active_inference/free_energy.py` |
-| Precision Weighting | Modulate learning rate by model confidence (Natural Gradient) | `active_inference/precision.py` |
-| Gardener Separation | Factored evaluation stream with Markov blanket | `active_inference/gardener.py` |
-| CMS Dreaming | Offline NREM pruning + REM exploration | `active_inference/dreaming.py` |
-| Neutral Drift | Micro-perturbation for dormant levels | `active_inference/drift.py` |
-| Thompson Sampling | Beta posterior over learning rates | `active_inference/thompson.py` |
-| Toroidal Flow | Bidirectional signaling between CMS levels | `active_inference/toroidal.py` |
-
----
-
-## VRAM Budget
-
-For Qwen 3B on RTX 4090 (24GB):
-
-| Component | VRAM |
-|-----------|------|
-| Base model (bf16) | ~6.0 GB |
-| DeepMemoryLevel projections (28 layers) | ~0.4 GB |
-| Memory MLPs + momentum | ~0.2 GB |
-| KV cache + activations | ~1.5 GB |
-| **Total** | **~8.1 GB** |
-
-Headroom for batch size, longer sequences, or additional features.
-
----
-
-## Testing
+### Train the scaffold
 
 ```bash
-# Run all tests (excludes deprecated LowRankLevel tests)
-pytest tests/ --ignore=tests/test_lowrank_thorough.py \
-    -k "not LowRank and not CompetenceGate and not CKA and not TestEndToEndLearning" -v
-
-# Run core CMS tests
-pytest tests/test_cms.py -k "TestCMSLevel or TestContinuumMemorySystem or TestDeepMemoryLevel or TestDeepMemoryEndToEnd" -v
-
-# Run full suite
-pytest tests/ -v
+python examples/train_scaffold.py \
+    --model Qwen/Qwen2.5-7B \
+    --steps 25000 \
+    --batch-size 4 \
+    --lr 3e-4 \
+    --warmup 5000 \
+    --test-inner-loop
 ```
 
-189 tests covering: CMS variants, deep memory learning, data-dependent gates, polynomial expansion, soul anchoring, gradient flow, neural memory, self-referential projections, M3 optimizer, all 7 active inference extensions, training pipeline, model conversion, and evaluation metrics.
+### Interactive chat with learning
+
+```bash
+python examples/serve_anamnesis.py --session alice
+```
+
+Every conversation updates the memory. `/save` persists the session. `/reset` returns to baseline. `/status` shows learning metrics.
+
+---
+
+## The Vessel Concept
+
+Train the scaffold once on a corpus of meta-cognitive text -- how minds form, how identity develops, how to reason and adapt. This creates an **empty vessel**: a model that knows HOW to become someone but isn't anyone yet.
+
+Then deploy it. Each user's conversations fill the vessel differently:
+- Talk about code for 200 turns and it becomes a code reviewer
+- Talk about therapy for 200 turns and it becomes a therapist
+- Talk about cooking for 200 turns and it becomes a chef
+
+Same vessel. Same base model. Different lives. The identity is in the memory weights, not the system prompt. It persists across sessions. It survives context window truncation.
+
+### Vessel Training Corpus
+
+19,470 passages across 10 categories:
+
+| Category | Passages | Purpose |
+|----------|----------|---------|
+| Metacognition | 9,116 | Reasoning traces, preference pairs |
+| Theory of Mind | 4,059 | Perspective-taking, false belief |
+| Soul Vessel | 2,074 | Predictive self, free energy, contemplative traditions |
+| Scaffold | 2,110 | Epistemology, adaptation, ontology, communication |
+| Reasoning | 211 | Logic, Bayesian thinking, debugging |
+| + 5 more | ... | Diverse domain coverage |
 
 ---
 
@@ -240,23 +164,68 @@ pytest tests/ -v
 
 ```
 anamnesis/
-+-- core/                     # Core architecture
-|   +-- cms.py                # CMS: L0 (SwiGLU) + L1 (DeepMemoryLevel)
-|   +-- memory.py             # MemoryMLP + vmap+grad (shared by CMS and NeuralMemory)
-|   +-- self_ref.py           # Self-Referential K/V Projections
-|   +-- block.py              # HopeBlock: Attention + CMS
-|   +-- model.py              # HopeModel + HopeConfig
-|   +-- dgd.py                # Delta Gradient Descent
-|   +-- rope.py               # Rotary Position Embeddings
-+-- optim/                    # Optimizers
-|   +-- m3.py                 # Multi-scale Momentum Muon (M3)
-|   +-- newton_schulz.py      # NS-5 Orthogonalization
-+-- active_inference/         # Novel extensions (7 modules)
-+-- convert/                  # Model conversion (Qwen, generic HF)
-+-- state/                    # CMS state persistence
-+-- training/                 # Training pipeline + data loading
-+-- evaluation/               # Metrics (perplexity, CKA, CMS delta)
-+-- kernels/                  # Triton stubs (Phase 6)
++-- core/
+|   +-- cms.py           # CMS: L0 (SwiGLU) + DeepMemoryLevel (ATLAS)
+|   +-- memory.py        # MemoryMLP + vmap+grad (shared infrastructure)
+|   +-- block.py         # HopeBlock: Attention + optional NeuralMemory + CMS
+|   +-- model.py         # HopeModel + HopeConfig
+|   +-- rope.py          # Rotary Position Embeddings
+|   +-- self_ref.py      # Self-Referential Projections (experimental)
+|   +-- dgd.py           # Delta Gradient Descent (experimental)
++-- optim/
+|   +-- m3.py            # Multi-scale Momentum Muon (M3)
+|   +-- newton_schulz.py # NS-5 Orthogonalization
++-- active_inference/    # 7 Active Inference extensions
++-- convert/
+|   +-- generic.py       # HuggingFace -> Anamnesis (SVD initialization)
+|   +-- qwen.py          # Qwen-specific conversion
++-- state/
+|   +-- persistence.py   # CMS state save/load + soul checkpoints
++-- training/
+|   +-- trainer.py       # Full Anamnesis trainer with active inference
+|   +-- data.py          # Dataset loading + signal annotations
++-- evaluation/
+|   +-- metrics.py       # PPL, CMS delta, CKA, surprise profile
++-- kernels/             # Triton stubs (Phase 6)
+examples/
++-- train_scaffold.py    # Scaffold training on vessel corpus
++-- serve_anamnesis.py   # Production server with session persistence
++-- train_specialists.py # Proof: two specialists from one model
++-- prove_specialization.py  # Domain A vs B PPL measurement
++-- prove_memory_vs_prompt.py  # The honest test: memory alone vs prompt
+data/
++-- scaffold_training/   # 19,470 passages vessel corpus
+    +-- metacognition/
+    +-- theory_of_mind/
+    +-- soul_vessel/
+    +-- scaffold/
+    +-- rationality/
+```
+
+---
+
+## Key Equations
+
+**Associative Memory Loss:**
+```
+L = ||M(phi(k_t)) - v_t||^2
+```
+
+**Polynomial Feature Expansion (ATLAS):**
+```
+phi(k) = [a_1*k, a_2*k^2, ...], a_i = 1/i! (Taylor init)
+```
+
+**Momentum Weight Update (Titans):**
+```
+S_t = eta_t * S_{t-1} - theta_t * nabla_L    (surprise momentum)
+M_t = (1 - alpha_t) * M_{t-1} + S_t          (memory update)
+```
+
+**Omega Rule (ATLAS):**
+```
+gamma_i = sigmoid(W_gamma @ x_i)              (per-token importance)
+g_weighted = sum(gamma_i * g_i) / sum(gamma_i) (weighted gradient average)
 ```
 
 ---
@@ -267,9 +236,8 @@ anamnesis/
 - Behrouz et al., "[ATLAS: Learning to Optimally Memorize the Context at Test Time](https://arxiv.org/abs/2505.23735)" (2025)
 - Behrouz et al., "[Nested Learning: The Illusion of Deep Learning Architecture](https://openreview.net/forum?id=nbMeRvNb7A)" (NeurIPS 2025)
 - Behrouz & Zhong, "[Titans: Learning to Memorize at Test Time](https://arxiv.org/abs/2501.00663)" (2025)
-- Friston, "[The Free Energy Principle](https://www.nature.com/articles/nrn2787)" (2010)
-- Kornblith et al., "[Similarity of Neural Network Representations Revisited](https://arxiv.org/abs/1905.00414)" (CKA metric)
-- Ilharco et al., "[Editing Models with Task Arithmetic](https://arxiv.org/abs/2212.04089)" (Task vectors)
+- Behrouz et al., "[Memory Caching: RNNs with Growing Memory](https://arxiv.org/abs/2602.24281)" (2026)
+- Behrouz et al., "[Titans + MIRAS: Helping AI have long-term memory](https://research.google/blog/titans-miras-helping-ai-have-long-term-memory/)" (2025)
 
 ### Built on
 - [lucidrains/titans-pytorch](https://github.com/lucidrains/titans-pytorch) -- Neural memory reference
