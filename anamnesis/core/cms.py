@@ -1022,13 +1022,13 @@ class DeepMemoryLevel(nn.Module):
             token_grads = self._compute_per_token_gradients(k_flat, v_flat, params)
 
             # [ATLAS] Weighted average using per-token importance (γ_i^(t))
-            tw = token_weights[:, chunk_start:chunk_end].reshape(-1, 1)  # (batch*chunk, 1)
+            tw = token_weights[:, chunk_start:chunk_end].reshape(-1, 1)
             n_tokens = k_flat.shape[0]
             weighted_grads = {}
             for name, g in token_grads.items():
-                # Weight each token's gradient by its importance
                 g_weighted = g * tw.view(-1, *([1] * (g.dim() - 1)))
                 weighted_grads[name] = g_weighted.sum(dim=0) / (tw.sum() + 1e-8)
+            del token_grads, g_weighted  # free VRAM immediately
 
             # Chunk-averaged gate values
             avg_lr = lr_raw[:, chunk_start:chunk_end].mean()
