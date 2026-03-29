@@ -252,4 +252,4 @@ Apache 2.0
 
 ## Author
 
-Aidan McInerny / [Relic Studios](https://github.com/Relic-Studios)
+Aidan Poole / [Relic Studios](https://github.com/Relic-Studios)
