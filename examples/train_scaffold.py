@@ -250,7 +250,10 @@ def main():
     parser.add_argument("--gradient-checkpointing", action="store_true",
                         help="Use gradient checkpointing to reduce VRAM (slower but fits larger models)")
     parser.add_argument("--eval-only", action="store_true")
-    parser.add_argument("--checkpoint", default="")
+    parser.add_argument("--checkpoint", default="",
+                        help="Resume from this checkpoint file")
+    parser.add_argument("--resume-step", type=int, default=0,
+                        help="Resume training from this step (skips data, adjusts LR)")
     parser.add_argument("--test-inner-loop", action="store_true",
                         help="After training, test if inner loop works")
     args = parser.parse_args()
@@ -370,7 +373,15 @@ def main():
     t0 = time.time()
     losses = []
 
-    for step, batch in enumerate(data_iter, 1):
+    start_step = args.resume_step
+    if start_step > 0:
+        print(f"  Resuming from step {start_step}, skipping data...")
+        for skip_step, _ in enumerate(data_iter, 1):
+            if skip_step >= start_step:
+                break
+        print(f"  Skipped to step {start_step}")
+
+    for step, batch in enumerate(data_iter, start_step + 1):
         if step > args.steps:
             break
 
