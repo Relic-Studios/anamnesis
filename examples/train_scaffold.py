@@ -438,12 +438,26 @@ def main():
     print(f"  Final PPL:    {final_ppl:.2f}")
     print(f"  Delta:        {final_ppl - baseline_ppl:+.2f}")
 
-    # Save final checkpoint
+    # Save final checkpoint — DeepMemoryLevel weights only (same as intermediates)
+    # The full model can be reconstructed: base model + these weights
     ckpt = {
-        "model_state": model.state_dict(),
+        "model_state": {
+            k: v.cpu() for k, v in model.state_dict().items()
+            if any(dm_key in k for dm_key in [
+                'to_k', 'to_v', 'to_q', 'out_proj',
+                'to_lr', 'to_momentum', 'to_decay', 'to_output_gate',
+                'to_token_weight',      # Omega Rule
+                'memory',                # MemoryMLP
+                'mem_out_proj', 'v_expand',
+                'persistent_memory',     # Titans persistent tokens
+                'conv_k', 'conv_q', 'conv_v',  # Depthwise convolutions
+                'poly_coeffs',           # Learned polynomial coefficients
+            ])
+        },
         "step": args.steps,
         "baseline_ppl": baseline_ppl,
         "final_ppl": final_ppl,
+        "loss": losses[-1] if losses else 0.0,
         "config": {k: (list(v) if isinstance(v, (list, tuple)) else v)
                    for k, v in hope_config.__dict__.items()},
     }
@@ -463,8 +477,8 @@ def main():
         "lr": args.lr,
         "baseline_ppl": baseline_ppl,
         "final_ppl": final_ppl,
-        "trainable_params": trainable_count,
-        "frozen_params": frozen_count,
+        "trainable_params": deep_mem_count,
+        "frozen_params": l0_count + frozen_count,
         "training_time_minutes": elapsed / 60,
     }
     with open(output_dir / "results.json", "w") as f:
