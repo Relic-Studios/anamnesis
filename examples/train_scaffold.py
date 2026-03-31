@@ -430,6 +430,14 @@ def main():
             torch.save(ckpt, path)
             print(f"  Saved: {path} ({path.stat().st_size / 1e6:.0f} MB)")
 
+            # Rotate: keep only last 2 checkpoints to avoid filling disk
+            import glob
+            old_ckpts = sorted(glob.glob(str(output_dir / "step_*.pt")))
+            while len(old_ckpts) > 2:
+                oldest = old_ckpts.pop(0)
+                Path(oldest).unlink()
+                print(f"  Rotated out: {oldest}")
+
     # ── Final eval ──
     elapsed = time.time() - t0
     print(f"\n[5] Training complete ({elapsed/60:.1f} minutes)")
